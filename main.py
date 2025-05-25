@@ -1,134 +1,71 @@
-import asyncio
-import logging
-import os
-import feedparser
 import requests
-from aiogram import Bot
-from datetime import datetime, timedelta
-from PIL import Image, ImageDraw, ImageFont
+import feedparser
 import json
-
-import sys
 import time
+import os
+import openai
+from PIL import Image
+from io import BytesIO
+from telegram import Bot
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-CHANNEL_ID = os.environ.get('CHANNEL_ID')
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 bot = Bot(token=BOT_TOKEN)
+openai.api_key = OPENAI_API_KEY
 
-FEEDS = [
-    "http://rss.cnn.com/rss/edition.rss",
-    "http://feeds.reuters.com/Reuters/domesticNews",
-    "http://feeds.bbci.co.uk/news/rss.xml",
-    "http://feeds.foxnews.com/foxnews/latest",
+rss_feeds = [
+    "http://feeds.reuters.com/reuters/topNews",
+    "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+    "https://www.cbsnews.com/latest/rss/main",
+    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
     "https://www.npr.org/rss/rss.php?id=1001"
 ]
 
-POSTED_URLS_FILE = 'sent_urls.json'
-CHECK_INTERVAL = 300  # 5 минут
-POST_WINDOW = 2  # часы, сколько времени считаем новость "свежей"
+try:
+    with open("sent_titles.json", "r") as file:
+        sent_titles = json.load(file)
+except FileNotFoundError:
+    sent_titles = []
 
-posted_urls = set()
+def generate_summary(title, description):
+    prompt = f"Summarize the following news in 1-2 sentences for a Telegram post:\n\nTitle: {title}\n\nContent: {description}"
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[{{ "role": "user", "content": prompt }}],
+        max_tokens=60,
+        temperature=0.7
+    )
+    return response.choices[0].message.content.strip()
 
-def load_posted_urls():
-    if os.path.exists(POSTED_URLS_FILE):
-        with open(POSTED_URLS_FILE, 'r') as f:
-            return set(json.load(f))
-    return set()
-
-def save_posted_urls(posted_urls):
-    with open(POSTED_URLS_FILE, 'w') as f:
-        json.dump(list(posted_urls), f)
-
-def create_title_image(text, output_path="headline.png"):
-    width, height = 1024, 512
-    background = (0, 0, 0)
-    text_color = (255, 255, 255)
-
-    image = Image.new('RGB', (width, height), background)
-    draw = ImageDraw.Draw(image)
-
-    try:
-        font = ImageFont.truetype("arial.ttf", 44)
-    except:
-        font = ImageFont.load_default()
-
-    words = text.split()
-    lines = []
-    line = ''
-    for word in words:
-        test_line = line + word + ' '
-        if draw.textlength(test_line, font=font) < width - 80:
-            line = test_line
-        else:
-            lines.append(line)
-            line = word + ' '
-    lines.append(line)
-
-    y = height // 2 - (len(lines) * 30)
-    for line in lines:
-        draw.text((50, y), line.strip(), fill=text_color, font=font)
-        y += 50
-
-    image.save(output_path)
-    return output_path
-
-def fetch_news():
-    articles = []
-    for feed_url in FEEDS:
+def send_news():
+    for feed_url in rss_feeds:
         feed = feedparser.parse(feed_url)
         for entry in feed.entries:
-            published = entry.get("published_parsed")
-            if published:
-                pub_date = datetime.fromtimestamp(time.mktime(published))
-                if datetime.utcnow() - pub_date > timedelta(hours=POST_WINDOW):
-                    continue
-            url = entry.get("link")
-            if url and url not in posted_urls:
-                articles.append({
-                    "title": entry.get("title", ""),
-                    "summary": entry.get("summary", ""),
-                    "url": url,
-                    "image": entry.get("media_content", [{}])[0].get("url", None)
-                })
-    return articles
+            title = entry.title
+            if title in sent_titles:
+                continue
 
-async def send_article(article):
-    try:
-        url = article['url']
-        title = article['title']
-        summary = article.get('summary', '')
-        image_url = article.get('image')
+            summary = entry.summary if 'summary' in entry else ""
+            summary_text = generate_summary(title, summary)
 
-        if url in posted_urls:
-            return
+            message = f"<b>{title}</b>\n\n{summary_text}"
 
-        posted_urls.add(url)
-        save_posted_urls(posted_urls)
+            if "media_content" in entry and entry.media_content:
+                image_url = entry.media_content[0]["url"]
+                response = requests.get(image_url)
+                image = BytesIO(response.content)
+                bot.send_photo(chat_id=CHANNEL_ID, photo=image, caption=message, parse_mode="HTML")
+            else:
+                bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
 
-        text = f"<b>{title}</b>\n\n{summary.strip()}" if summary else f"<b>{title}</b>"
+            sent_titles.append(title)
+            with open("sent_titles.json", "w") as file:
+                json.dump(sent_titles, file)
 
-        if image_url:
-            await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=text, parse_mode='HTML')
-        else:
-            image_path = create_title_image(title)
-            with open(image_path, 'rb') as photo:
-                await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=text, parse_mode='HTML')
+        time.sleep(5)
 
-        print(f"Отправлено: {title}")
-
-    except Exception as e:
-        logging.exception(f"Ошибка при отправке статьи: {e}")
-
-async def news_loop():
-    global posted_urls
-    posted_urls = load_posted_urls()
-    print("Бот запущен...")
-    while True:
-        articles = fetch_news()
-        print(f"Найдено {len(articles)} свежих новостей")
-        for article in articles:
-            await send_article(article)
-        await asyncio.sleep(CHECK_INTERVAL)
-
-if __name__ == "__main__":
-    asyncio.run(news_loop())
+while True:
+    send_news()
+    time.sleep(300)
