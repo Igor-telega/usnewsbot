@@ -2,94 +2,85 @@ import os
 import json
 import asyncio
 import feedparser
-import requests
 from aiogram import Bot, Dispatcher
 from aiogram.types import InputFile
 from openai import OpenAI
+from dotenv import load_dotenv
+import requests
 
-# Загружаем переменные окружения
+load_dotenv()
+
+# Загружаем ключи из переменных среды
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Инициализация бота и OpenAI
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(bot)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-SENT_TITLES_FILE = "sent_titles.json"
+# Загружаем уже опубликованные заголовки
+def load_sent_titles():
+    try:
+        with open("sent_titles.json", "r") as f:
+            return json.load(f)["titles"]
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
 
-# Загружаем уже отправленные заголовки
-if os.path.exists(SENT_TITLES_FILE):
-    with open(SENT_TITLES_FILE, "r") as f:
-        sent_titles = json.load(f)["titles"]
-else:
-    sent_titles = []
+# Сохраняем новые заголовки
+def save_sent_titles(titles):
+    with open("sent_titles.json", "w") as f:
+        json.dump({"titles": titles}, f)
 
-# Получаем новости с NewsAPI
-def get_news():
-    url = (
-        f"https://newsapi.org/v2/top-headlines?country=us&pageSize=5&apiKey={NEWS_API_KEY}"
-    )
-    response = requests.get(url)
-    articles = response.json().get("articles", [])
-    return articles
-
-# Генерируем краткое описание через OpenAI
-def generate_summary(title, content):
-    prompt = f"Summarize the following news story in one short sentence:\n\nTitle: {title}\n\nContent: {content}"
+# Генерация краткой сводки
+def generate_summary(title, description):
+    prompt = f"Summarize the following news in one short sentence:\n\nTitle: {title}\n\nDescription: {description}"
     response = client.chat.completions.create(
-        model="gpt-4",
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content.strip()
 
-# Отправка новостей в Telegram
+# Получение изображения
+def get_image_url(article):
+    return article.get("urlToImage")
+
+# Отправка новости
 async def send_news():
-    articles = get_news()
+    sent_titles = load_sent_titles()
+
+    url = f"https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}"
+    response = requests.get(url)
+    articles = response.json().get("articles", [])
+
     for article in articles:
-        title = article.get("title")
-        content = article.get("description", "")
-        url = article.get("url")
-        image_url = article.get("urlToImage")
+        title = article["title"]
+        description = article.get("description", "")
+        image_url = get_image_url(article)
 
         if title in sent_titles:
             continue
 
+        summary = generate_summary(title, description)
+
         try:
-            summary = generate_summary(title, content)
-
-            caption = f"<b>{title}</b>\n\n{summary}"
-            if url:
-                caption += f"\n\n<a href='{url}'>Read more</a>"
-
             if image_url:
                 image_data = requests.get(image_url).content
                 with open("temp.jpg", "wb") as f:
                     f.write(image_data)
                 photo = InputFile("temp.jpg")
-                await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=caption, parse_mode="HTML")
-                os.remove("temp.jpg")
+                await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=f"{title}\n\n{summary}")
             else:
-                await bot.send_message(chat_id=CHANNEL_ID, text=caption, parse_mode="HTML")
-
-            sent_titles.append(title)
-            with open(SENT_TITLES_FILE, "w") as f:
-                json.dump({"titles": sent_titles}, f)
-
-            await asyncio.sleep(5)
-
+                await bot.send_message(chat_id=CHANNEL_ID, text=f"{title}\n\n{summary}")
         except Exception as e:
             print("Error sending news:", e)
+            continue
 
-# Запуск
-async def main():
-    await send_news()
-    await bot.session.close()
+        sent_titles.append(title)
+        save_sent_titles(sent_titles)
+
+        await asyncio.sleep(3)  # Пауза между публикациями
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(send_news())
