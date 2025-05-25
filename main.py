@@ -1,102 +1,86 @@
+import os
 import json
-import time
 import requests
-import feedparser
-import openai
 import asyncio
-from telegram import Bot
-from telegram.error import TelegramError
+import logging
 from PIL import Image
 from io import BytesIO
+import feedparser
+import openai
+from telegram import Bot
 
-import os
-
+# Настройки
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+bot = Bot(token=BOT_TOKEN)
 openai.api_key = OPENAI_API_KEY
 
-RSS_FEEDS = [
-    "http://feeds.bbci.co.uk/news/rss.xml",
-    "https://rss.cnn.com/rss/edition.rss",
-    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
-    "https://www.aljazeera.com/xml/rss/all.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
-]
-
+# Загружаем отправленные заголовки
 SENT_TITLES_FILE = "sent_titles.json"
+if os.path.exists(SENT_TITLES_FILE):
+    with open(SENT_TITLES_FILE, "r") as f:
+        sent_titles = json.load(f).get("titles", [])
+else:
+    sent_titles = []
 
-def load_sent_titles():
-    try:
-        with open(SENT_TITLES_FILE, "r") as f:
-            return json.load(f)["titles"]
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-def save_sent_titles(titles):
+def save_sent_title(title):
+    sent_titles.append(title)
     with open(SENT_TITLES_FILE, "w") as f:
-        json.dump({"titles": titles}, f)
+        json.dump({"titles": sent_titles}, f)
+
+async def fetch_news():
+    url = f"https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}"
+    response = requests.get(url)
+    data = response.json()
+    return data["articles"]
+
+async def generate_summary(title, description):
+    prompt = f"Summarize the following news in one short sentence:
+
+Title: {title}
+Description: {description}"
+    try:
+        chat_response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=60,
+            temperature=0.7,
+        )
+        return chat_response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"OpenAI Error: {e}")
+        return "Short summary unavailable."
 
 async def send_news():
-    bot = Bot(token=BOT_TOKEN)
-    sent_titles = load_sent_titles()
+    articles = await fetch_news()
+    for article in articles:
+        title = article["title"]
+        if title in sent_titles:
+            continue
 
-    for url in RSS_FEEDS:
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:3]:
-            title = entry.title
-            link = entry.link
-            summary = entry.get("summary", "")
+        summary = await generate_summary(title, article.get("description", ""))
+        image_url = article.get("urlToImage")
+        text = f"<b>{title}</b>
 
-            if title in sent_titles:
-                continue
+{summary}"
 
-            short_summary = generate_summary(title, summary)
-            image_url = extract_image(entry)
+        try:
+            if image_url:
+                response = requests.get(image_url)
+                image = BytesIO(response.content)
+                await bot.send_photo(chat_id=CHANNEL_ID, photo=image, caption=text, parse_mode="HTML")
+            else:
+                await bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="HTML")
 
-            caption = f"{title}\n\n{short_summary}"
-
-            try:
-                if image_url:
-                    image = download_image(image_url)
-                    bot.send_photo(chat_id=CHANNEL_ID, photo=image, caption=caption)
-                else:
-                    bot.send_message(chat_id=CHANNEL_ID, text=caption)
-                sent_titles.append(title)
-                save_sent_titles(sent_titles)
-                time.sleep(5)
-            except TelegramError as e:
-                print(f"Telegram error: {e}")
-                continue
-
-def generate_summary(title, text):
-    prompt = f"Summarize the following news story in one clear sentence:\nTitle: {title}\nText: {text}"
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=60
-        )
-        return response["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print("OpenAI error:", e)
-        return text
-
-def extract_image(entry):
-    media = entry.get("media_content", [])
-    if media:
-        return media[0].get("url")
-    if "image" in entry:
-        return entry.image.get("href")
-    return None
-
-def download_image(url):
-    response = requests.get(url)
-    if response.status_code == 200:
-        return BytesIO(response.content)
-    return None
+            save_sent_title(title)
+            await asyncio.sleep(2)
+        except Exception as e:
+            logging.error(f"Telegram Error: {e}")
 
 if __name__ == "__main__":
     asyncio.run(send_news())
