@@ -2,4 +2,4 @@ openai>=1.0.0
 aiogram==2.25.2
 requests
 feedparser
-python_dotenv
+python-dotenv
