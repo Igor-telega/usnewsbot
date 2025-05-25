@@ -2,3 +2,4 @@ python-telegram-bot==20.3
 requests==2.31.0
 aiogram
 Pillow
+feedparser==6.0.10
