@@ -4,19 +4,17 @@ import feedparser
 import requests
 import hashlib
 from aiogram import Bot, Dispatcher
-from aiogram.types import FSInputFile
 from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from dotenv import load_dotenv
-from datetime import datetime
+from aiogram.types import InputFile
 from openai import OpenAI
+from dotenv import load_dotenv
 import json
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai = OpenAI(api_key=OPENAI_API_KEY)
 
 RSS_FEEDS = {
     "NYT": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
@@ -27,126 +25,126 @@ RSS_FEEDS = {
 }
 
 MAX_POSTS_PER_RUN = 5
-HASHES_FILE = "sent_hashes.json"
+SENT_TITLES_FILE = "sent_titles.json"
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 def load_sent_hashes():
-    if not os.path.exists(HASHES_FILE):
-        return set()
-    with open(HASHES_FILE, "r") as file:
-        return set(json.load(file))
+    if not os.path.exists(SENT_TITLES_FILE):
+        return []
+    with open(SENT_TITLES_FILE, "r") as file:
+        data = json.load(file)
+        return data.get("hashes", [])
 
 def save_sent_hashes(hashes):
-    with open(HASHES_FILE, "w") as file:
-        json.dump(list(hashes), file)
+    with open(SENT_TITLES_FILE, "w") as file:
+        json.dump({"hashes": hashes}, file)
 
-def make_news_hash(title, summary):
-    content = (title + summary).strip().lower().encode("utf-8")
-    return hashlib.sha256(content).hexdigest()
+def generate_hash(title, summary):
+    return hashlib.sha256((title + summary).encode("utf-8")).hexdigest()
+
+async def summarize_text(text):
+    chat_completion = openai.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": (
+                "You are a professional news editor for a U.S. audience. "
+                "Summarize this news in 4–6 sentences in a clear, journalistic tone. "
+                "Avoid phrases like 'this article states'. Focus on facts, avoid repeating the title."
+            )},
+            {"role": "user", "content": text}
+        ]
+    )
+    return chat_completion.choices[0].message.content.strip()
+
+async def generate_image(prompt, filename="news_image.jpg"):
+    try:
+        response = openai.images.generate(prompt=prompt, model="dall-e-3", n=1, size="1024x1024")
+        image_url = response.data[0].url
+        image_data = requests.get(image_url).content
+        with open(filename, "wb") as f:
+            f.write(image_data)
+        return filename
+    except Exception as e:
+        print(f"Image generation error: {e}")
+        return None
 
 def classify_hashtags(title, summary):
     text = (title + " " + summary).lower()
     tags = []
-
-    if any(word in text for word in ["election", "biden", "trump", "senate", "government", "republican", "democrat"]):
-        tags.extend(["#Politics", "#USA"])
-    if any(word in text for word in ["economy", "inflation", "stock", "market", "finance", "bank", "budget"]):
-        tags.extend(["#Economy", "#Business"])
-    if any(word in text for word in ["ai", "artificial intelligence", "technology", "robot", "innovation"]):
-        tags.extend(["#Tech", "#AI"])
-    if any(word in text for word in ["covid", "vaccine", "hospital", "health", "cdc"]):
-        tags.extend(["#Health"])
-    if any(word in text for word in ["storm", "hurricane", "flood", "earthquake", "wildfire", "weather"]):
-        tags.extend(["#Weather"])
-    if any(word in text for word in ["crime", "shooting", "murder", "police", "arrest", "attack"]):
-        tags.extend(["#Crime"])
-    if any(word in text for word in ["russia", "ukraine", "israel", "china", "nato", "iran", "war", "diplomacy"]):
-        tags.extend(["#World", "#Conflict"])
+    if any(w in text for w in ["biden", "trump", "senate", "white house", "republican", "democrat"]):
+        tags.append("#Politics")
+    if any(w in text for w in ["war", "ukraine", "russia", "nato", "gaza", "israel", "iran"]):
+        tags.append("#Conflict")
+    if any(w in text for w in ["ai", "technology", "chatgpt", "robot", "tech"]):
+        tags.append("#Tech")
+    if any(w in text for w in ["inflation", "market", "jobs", "economy", "budget"]):
+        tags.append("#Economy")
+    if any(w in text for w in ["crime", "shooting", "police", "arrest"]):
+        tags.append("#Crime")
     if not tags:
         tags.append("#News")
-
-    return list(set(tags))[:3]
-
-async def summarize_text(text):
-    try:
-        chat_response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a professional news editor for a U.S. audience. "
-                        "Your job is to rewrite a short news brief (3–5 sentences) based on the headline and original text. "
-                        "Use neutral, journalistic tone. Do not repeat the headline. Do not say 'This article says...' or similar. "
-                        "Just tell the story clearly and concisely like a newswire update (AP, Reuters, NPR)."
-                    )
-                },
-                {"role": "user", "content": text}
-            ]
-        )
-        return chat_response.choices[0].message.content.strip()
-    except Exception as e:
-        print("OpenAI summarization error:", e)
-        return None
+    return " ".join(tags[:3])
 
 async def fetch_and_send_news():
     sent_hashes = load_sent_hashes()
-    new_hashes = set()
-    posts_sent = 0
+    new_hashes = []
 
     for source, url in RSS_FEEDS.items():
-        if posts_sent >= MAX_POSTS_PER_RUN:
-            break
         feed = feedparser.parse(url)
-
+        count = 0
         for entry in feed.entries:
             summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
-            news_hash = make_news_hash(entry.title, summary)
-
+            news_hash = generate_hash(entry.title, summary)
             if news_hash in sent_hashes or news_hash in new_hashes:
                 continue
 
-            image_url = None
-            if "media_content" in entry and entry.media_content:
-                image_url = entry.media_content[0].get("url")
-
-            summarized = await summarize_text(f"{entry.title}\n\n{summary}")
-            if not summarized:
+            try:
+                summarized = await summarize_text(f"{entry.title}\n\n{summary}")
+            except Exception as e:
+                print("OpenAI summarization error:", e)
                 continue
 
-            hashtags = " ".join(classify_hashtags(entry.title, summary))
+            hashtags = classify_hashtags(entry.title, summary)
             message = f"<b>{entry.title}</b>\n\n{summarized}\n\n<i>{source}</i>\n{hashtags}"
 
             try:
+                image_url = None
+                if "media_content" in entry and entry.media_content:
+                    image_url = entry.media_content[0].get("url")
+
                 if image_url:
                     image_data = requests.get(image_url).content
                     with open("temp.jpg", "wb") as f:
                         f.write(image_data)
-                    photo = FSInputFile("temp.jpg")
+                    photo = InputFile("temp.jpg")
                     await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=message)
                     os.remove("temp.jpg")
                 else:
-                    await bot.send_message(chat_id=CHANNEL_ID, text=message)
+                    image_path = await generate_image(entry.title)
+                    if image_path:
+                        await bot.send_photo(chat_id=CHANNEL_ID, photo=InputFile(image_path), caption=message)
+                        os.remove(image_path)
+                    else:
+                        await bot.send_message(chat_id=CHANNEL_ID, text=message)
             except Exception as e:
                 print(f"Error sending message: {e}")
 
-            new_hashes.add(news_hash)
-            posts_sent += 1
-
-            if posts_sent >= MAX_POSTS_PER_RUN:
+            new_hashes.append(news_hash)
+            count += 1
+            if count >= MAX_POSTS_PER_RUN:
                 break
 
-    save_sent_hashes(sent_hashes.union(new_hashes))
+    save_sent_hashes(sent_hashes + new_hashes)
 
 async def main():
     while True:
         try:
             await fetch_and_send_news()
         except Exception as e:
-            print(f"Error during news fetch: {e}")
-        await asyncio.sleep(60)
+            print(f"Error during fetch: {e}")
+        await asyncio.sleep(300)  # каждые 5 минут
 
 if __name__ == "__main__":
     asyncio.run(main())
