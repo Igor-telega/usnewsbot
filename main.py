@@ -1,10 +1,12 @@
-import logging
 import os
-import requests
+import json
+import asyncio
+import logging
 import feedparser
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types
-from aiogram.enums import ParseMode
-from aiogram.utils.markdown import hbold
+from aiogram.types import ParseMode
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,37 +19,68 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-def fetch_news():
-    url = f"https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}"
-    response = requests.get(url)
-    if response.status_code == 200:
-        articles = response.json().get("articles", [])
-        return articles
-    else:
-        print("Failed to fetch news:", response.status_code)
-        return []
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-async def send_news():
-    articles = fetch_news()
-    for article in articles[:5]:  # Отправляем только 5 свежих новостей
-        title = article["title"]
-        url = article["url"]
-        caption = f"{hbold(title)}\n\n<a href='{url}'>Read more</a>"
+RSS_URL = f"https://newsdata.io/api/1/news?apikey={NEWS_API_KEY}&country=us&language=en&category=top"
+
+SENT_TITLES_FILE = "/data/sent_titles.json"
+
+def load_sent_titles():
+    if os.path.exists(SENT_TITLES_FILE):
+        with open(SENT_TITLES_FILE, "r") as f:
+            return json.load(f)["titles"]
+    return []
+
+def save_sent_titles(titles):
+    with open(SENT_TITLES_FILE, "w") as f:
+        json.dump({"titles": titles}, f)
+
+async def fetch_news():
+    feed = feedparser.parse(RSS_URL)
+    sent_titles = load_sent_titles()
+    new_titles = []
+
+    for entry in feed.entries:
+        title = entry.title.strip()
+        summary = entry.summary.strip()
+        link = entry.link.strip()
+
+        if title in sent_titles:
+            continue
+
+        # Объединяем заголовок + краткое описание для отправки в ChatGPT
+        full_text = f"{title}\n\n{summary}"
+
         try:
-            await bot.send_message(chat_id=CHANNEL_ID, text=caption)
-        except Exception as e:
-            logging.error("Error sending news:", exc_info=e)
+            response = client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a news editor. Summarize news in 4–5 informative sentences, keeping it engaging and factual. Do not include links."},
+                    {"role": "user", "content": full_text}
+                ],
+                max_tokens=500,
+                temperature=0.7
+            )
 
-@dp.startup()
-async def on_startup(dispatcher):
-    await send_news()
+            summary_text = response.choices[0].message.content.strip()
+
+            caption = f"<b>{title}</b>\n\n{summary_text}"
+
+            await bot.send_message(chat_id=CHANNEL_ID, text=caption)
+            new_titles.append(title)
+
+        except Exception as e:
+            logging.exception("Error sending news:")
+            continue
+
+    # Сохраняем новые заголовки, чтобы не дублировать
+    save_sent_titles(sent_titles + new_titles)
+
+async def main():
+    while True:
+        await fetch_news()
+        await asyncio.sleep(600)  # 10 минут
 
 if __name__ == "__main__":
-    import asyncio
-
-    async def main():
-        logging.basicConfig(level=logging.INFO)
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
-
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
