@@ -1,13 +1,13 @@
 import os
 import json
-import asyncio
-import logging
+import time
+import requests
 import feedparser
-from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from openai import OpenAI
+from aiogram.utils import executor
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
@@ -15,70 +15,74 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+NEWS_FEED_URL = "https://rss.nytimes.com/services/xml/rss/nyt/US.xml"
 
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-RSS_URL = f"https://newsdata.io/api/1/news?apikey={NEWS_API_KEY}&country=us&language=en&category=top"
-
-SENT_TITLES_FILE = "/data/sent_titles.json"
-
 def load_sent_titles():
-    if os.path.exists(SENT_TITLES_FILE):
-        with open(SENT_TITLES_FILE, "r") as f:
-            return json.load(f)["titles"]
-    return []
+    try:
+        with open("sent_titles.json", "r") as file:
+            data = json.load(file)
+            return data.get("titles", [])
+    except FileNotFoundError:
+        return []
 
-def save_sent_titles(titles):
-    with open(SENT_TITLES_FILE, "w") as f:
-        json.dump({"titles": titles}, f)
+def save_sent_title(title):
+    titles = load_sent_titles()
+    titles.append(title)
+    with open("sent_titles.json", "w") as file:
+        json.dump({"titles": titles}, file)
 
-async def fetch_news():
-    feed = feedparser.parse(RSS_URL)
+def generate_summary(text):
+    prompt = f"Summarize the following news in 2-3 sentences in English:\n\n{text}"
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print("OpenAI error:", e)
+        return None
+
+def create_post(title, summary):
+    return f"<b>{title}</b>\n\n{summary}"
+
+async def check_news():
     sent_titles = load_sent_titles()
-    new_titles = []
+    feed = feedparser.parse(NEWS_FEED_URL)
+
+    # Вставляем тестовую новость
+    test_entry = {
+        "title": "Test News Title",
+        "link": "https://example.com",
+        "summary": "This is a test summary from the inserted article."
+    }
+    feed.entries.insert(0, test_entry)
 
     for entry in feed.entries:
-        title = entry.title.strip()
-        summary = entry.summary.strip()
-        link = entry.link.strip()
+        title = entry.title
+        summary = entry.summary
+        if title not in sent_titles:
+            full_summary = generate_summary(summary)
+            if full_summary:
+                message = create_post(title, full_summary)
+                try:
+                    await bot.send_message(chat_id=CHANNEL_ID, text=message)
+                    save_sent_title(title)
+                    print(f"Posted: {title}")
+                except Exception as e:
+                    print("Telegram error:", e)
+            else:
+                print("Skipping due to OpenAI summary failure.")
 
-        if title in sent_titles:
-            continue
-
-        full_text = f"{title}\n\n{summary}"
-
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are a news editor. Summarize news in 4–5 informative sentences, keeping it engaging and factual. Do not include links."},
-                    {"role": "user", "content": full_text}
-                ],
-                max_tokens=500,
-                temperature=0.7
-            )
-
-            summary_text = response.choices[0].message.content.strip()
-
-            caption = f"<b>{title}</b>\n\n{summary_text}"
-
-            await bot.send_message(chat_id=CHANNEL_ID, text=caption)
-            new_titles.append(title)
-
-        except Exception as e:
-            logging.exception("Error sending news:")
-            continue
-
-    save_sent_titles(sent_titles + new_titles)
-
-async def main():
-    while True:
-        await fetch_news()
-        await asyncio.sleep(600)
+@dp.message_handler(commands=["start"])
+async def start_handler(message: types.Message):
+    await message.answer("US News Radar is running!")
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+    from asyncio import run
+    run(check_news())
