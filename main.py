@@ -48,7 +48,6 @@ def make_news_hash(title, summary):
 
 def classify_hashtags(title, summary):
     text = (title + " " + summary).lower()
-
     tags = []
 
     if any(word in text for word in ["election", "biden", "trump", "senate", "government", "republican", "democrat"]):
@@ -75,7 +74,15 @@ async def summarize_text(text):
         chat_response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a news summarizer. Write in English, 3–5 sentences, informative, concise, and engaging."},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a professional news editor for a U.S. audience. "
+                        "Your job is to rewrite a short news brief (3–5 sentences) based on the headline and original text. "
+                        "Use neutral, journalistic tone. Do not repeat the headline. Do not say 'This article says...' or similar. "
+                        "Just tell the story clearly and concisely like a newswire update (AP, Reuters, NPR)."
+                    )
+                },
                 {"role": "user", "content": text}
             ]
         )
