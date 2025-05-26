@@ -32,7 +32,7 @@ RSS_FEEDS = {
 
 MAX_POSTS_PER_RUN = 5
 SENT_HASHES_FILE = "sent_titles.json"
-NEWS_MAX_AGE_HOURS = 24  # Сколько часов считаем новость "свежей"
+NEWS_MAX_AGE_HOURS = 24  # Maximum news age in hours
 
 def load_sent_hashes():
     if not os.path.exists(SENT_HASHES_FILE):
@@ -48,6 +48,13 @@ def save_sent_hashes(hashes):
 def generate_hash(title, summary):
     combined = (title + summary).strip().lower()
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
+
+def format_publish_date(published):
+    try:
+        date = datetime.fromtimestamp(time.mktime(published))
+        return date.strftime("%B %d, %Y")
+    except:
+        return None
 
 async def summarize_article(title, summary):
     prompt = f"""Summarize the following news article in 3–5 concise sentences in fluent English. Don't write that it's a news article or summary — just explain it in simple terms as if writing a news brief:
@@ -91,20 +98,23 @@ async def fetch_and_send_news():
         feed = feedparser.parse(url)
         count = 0
         for entry in feed.entries:
-            # 1. Проверка возраста новости
+            # 1. Filter old news
             published = getattr(entry, 'published_parsed', None)
             if published:
                 news_time = datetime.fromtimestamp(time.mktime(published))
                 if datetime.utcnow() - news_time > timedelta(hours=NEWS_MAX_AGE_HOURS):
-                    continue  # новость слишком старая
+                    continue
+            else:
+                news_time = datetime.utcnow()
 
-            # 2. Хеш для защиты от дублей
+            formatted_date = format_publish_date(published)
+
+            # 2. Generate hash
             summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
             news_hash = generate_hash(entry.title, summary)
             if news_hash in sent_hashes or news_hash in new_hashes:
                 continue
 
-            # 3. Генерация текста и хештегов
             try:
                 summarized = await summarize_article(entry.title, summary)
                 hashtags = await generate_hashtags(summarized)
@@ -112,9 +122,13 @@ async def fetch_and_send_news():
                 print("OpenAI summarization error:", e)
                 continue
 
-            message = f"<b>{entry.title}</b>\n\n{summarized}\n\n<i>{source}</i>\n{hashtags}"
+            # 3. Compose message
+            message = f"<b>{entry.title}</b>\n\n{summarized}\n\n"
+            if formatted_date:
+                message += f"🕒 <i>Published: {formatted_date}</i>\n"
+            message += f"<i>{source}</i>\n{hashtags}"
 
-            # 4. Обработка изображения
+            # 4. Send message
             image_url = None
             if "media_content" in entry and entry.media_content:
                 image_url = entry.media_content[0].get("url")
