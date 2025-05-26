@@ -2,21 +2,24 @@ import asyncio
 import os
 import feedparser
 import requests
+import openai
+from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher
-from aiogram.types import InputFile
-from aiogram.enums import ParseMode
+from aiogram.types import FSInputFile
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 from datetime import datetime
 import json
-import openai
-import random
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
+
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
 RSS_FEEDS = {
     "NYT": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
@@ -29,12 +32,6 @@ RSS_FEEDS = {
 MAX_POSTS_PER_RUN = 5
 SENT_TITLES_FILE = "sent_titles.json"
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-dp = Dispatcher()
-
 def load_sent_titles():
     if not os.path.exists(SENT_TITLES_FILE):
         return []
@@ -46,26 +43,39 @@ def save_sent_titles(titles):
     with open(SENT_TITLES_FILE, "w") as file:
         json.dump({"titles": titles}, file)
 
-async def summarize_text(text):
-    response = await openai.ChatCompletion.acreate(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "You're a journalist. Summarize this article clearly in 4-6 sentences for a news post. The summary should sound like a short article, not a description."},
-            {"role": "user", "content": text}
-        ]
+async def summarize_article(title, summary):
+    prompt = f"""Summarize the following news article in 3–5 concise sentences in fluent English. Don't write that it's a news article or summary — just explain it in simple terms as if writing a news brief:
+
+Title: {title}
+Text: {summary}"""
+    response = await client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content.strip()
 
-async def generate_tags(text):
-    response = await openai.ChatCompletion.acreate(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "Analyze this short news article and suggest 2-3 short hashtags (1-2 words each, no # signs) in English that describe its core themes. Return tags separated by commas."},
-            {"role": "user", "content": text}
-        ]
+async def generate_hashtags(text):
+    prompt = f"""Suggest 2–3 relevant English hashtags for the following news summary. Only return hashtags separated by spaces. No hashtags like #news or #breaking — be more specific.
+
+Text: {text}"""
+    response = await client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}]
     )
-    tags = response.choices[0].message.content.strip()
-    return "#" + " #".join(tag.strip().replace(" ", "") for tag in tags.split(","))
+    return response.choices[0].message.content.strip()
+
+async def generate_image(prompt):
+    try:
+        image_resp = await client.images.generate(
+            model="dall-e-3",
+            prompt=prompt,
+            n=1,
+            size="1024x1024"
+        )
+        return image_resp.data[0].url
+    except Exception as e:
+        print("Image generation error:", e)
+        return None
 
 async def fetch_and_send_news():
     sent_titles = load_sent_titles()
@@ -83,24 +93,38 @@ async def fetch_and_send_news():
             if "media_content" in entry and entry.media_content:
                 image_url = entry.media_content[0].get("url")
 
+            article_text = f"{entry.title}\n{summary}"
             try:
-                full_text = f"{entry.title}\n{summary}"
-                summarized = await summarize_text(full_text)
-                hashtags = await generate_tags(summarized)
-                message = f"<b>{entry.title}</b>\n\n{summarized}\n\n<i>{source}</i>\n{hashtags}"
+                summarized = await summarize_article(entry.title, summary)
+                hashtags = await generate_hashtags(summarized)
+            except Exception as e:
+                print("OpenAI summarization error:", e)
+                continue
 
+            message = f"<b>{entry.title}</b>\n\n{summarized}\n\n<i>{source}</i>\n{hashtags}"
+
+            try:
                 if image_url:
                     image_data = requests.get(image_url).content
                     with open("temp.jpg", "wb") as f:
                         f.write(image_data)
-                    photo = InputFile("temp.jpg")
+                    photo = FSInputFile("temp.jpg")
                     await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=message)
                     os.remove("temp.jpg")
                 else:
-                    await bot.send_message(chat_id=CHANNEL_ID, text=message)
-
+                    image_prompt = f"Realistic illustration related to: {entry.title}"
+                    img_link = await generate_image(image_prompt)
+                    if img_link:
+                        img_data = requests.get(img_link).content
+                        with open("temp.jpg", "wb") as f:
+                            f.write(img_data)
+                        photo = FSInputFile("temp.jpg")
+                        await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=message)
+                        os.remove("temp.jpg")
+                    else:
+                        await bot.send_message(chat_id=CHANNEL_ID, text=message)
             except Exception as e:
-                print(f"Error sending message: {e}")
+                print("Error sending message:", e)
 
             new_titles.append(entry.title)
             count += 1
@@ -114,7 +138,7 @@ async def main():
         try:
             await fetch_and_send_news()
         except Exception as e:
-            print(f"Error during news fetch: {e}")
+            print("Error in main loop:", e)
         await asyncio.sleep(60)
 
 if __name__ == "__main__":
