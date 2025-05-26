@@ -3,18 +3,19 @@ import os
 import feedparser
 import requests
 from aiogram import Bot, Dispatcher
-from aiogram.enums import ParseMode
 from aiogram.types import FSInputFile
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 from datetime import datetime
+from openai import OpenAI
 import json
-import openai
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 RSS_FEEDS = {
     "NYT": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
@@ -27,7 +28,7 @@ RSS_FEEDS = {
 MAX_POSTS_PER_RUN = 5
 SENT_TITLES_FILE = "sent_titles.json"
 
-bot = Bot(token=BOT_TOKEN, default=ParseMode.HTML)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 def load_sent_titles():
@@ -42,14 +43,18 @@ def save_sent_titles(titles):
         json.dump({"titles": titles}, file)
 
 async def summarize_text(text):
-    response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {"role": "system", "content": "You are a news assistant."},
-            {"role": "user", "content": f"Summarize this news article in 3-5 sentences as a news brief for Telegram in English:\n{text}"}
-        ]
-    )
-    return response.choices[0].message.content.strip()
+    try:
+        chat_response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a news summarizer. Write in English, 3-5 sentences, informative, as if for a news feed. Don't just say what the article is about — tell the story."},
+                {"role": "user", "content": text}
+            ]
+        )
+        return chat_response.choices[0].message.content.strip()
+    except Exception as e:
+        print("OpenAI summarization error:", e)
+        return None
 
 async def fetch_and_send_news():
     sent_titles = load_sent_titles()
@@ -61,15 +66,14 @@ async def fetch_and_send_news():
         for entry in feed.entries:
             if entry.title in sent_titles:
                 continue
-            summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
+            summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
             image_url = None
             if "media_content" in entry and entry.media_content:
                 image_url = entry.media_content[0].get("url")
 
-            try:
-                summarized = await summarize_text(f"{entry.title}\n{summary}")
-            except Exception as e:
-                print("OpenAI summarization error:", e)
+            summarized = await summarize_text(f"{entry.title}\n\n{summary}")
+            if not summarized:
+                print(f"Skipping: OpenAI returned no summary for '{entry.title}'")
                 continue
 
             message = f"<b>{entry.title}</b>\n\n{summarized}\n\n<i>{source}</i>\n#AI #World"
