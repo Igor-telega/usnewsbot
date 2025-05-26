@@ -1,12 +1,16 @@
-import os
+mport os
+import logging
 import json
-import requests
-import feedparser
+import asyncio
+import aiohttp
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from aiogram.utils.markdown import hbold
+from aiogram.types import InputMediaPhoto
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
-import asyncio
+from newspaper import Article
+import openai
+import feedparser
 
 load_dotenv()
 
@@ -17,9 +21,19 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
+openai.api_key = OPENAI_API_KEY
+
+NEWS_FEEDS = {
+    "NY Times": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+    "CNN": "http://rss.cnn.com/rss/cnn_topstories.rss",
+    "Reuters": "http://feeds.reuters.com/reuters/topNews",
+    "AP": "https://rss.apnews.com/rss/apf-topnews",
+    "NPR": "https://www.npr.org/rss/rss.php?id=1001",
+    "The Guardian": "https://www.theguardian.com/world/rss"
+}
 
 SENT_TITLES_FILE = "sent_titles.json"
-FEED_URL = "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
+
 
 def load_sent_titles():
     if not os.path.exists(SENT_TITLES_FILE):
@@ -28,68 +42,95 @@ def load_sent_titles():
         data = json.load(f)
         return set(data.get("titles", []))
 
+
 def save_sent_titles(titles):
     with open(SENT_TITLES_FILE, "w") as f:
         json.dump({"titles": list(titles)}, f)
 
-def extract_hashtags(text):
-    hashtags = []
-    lower_text = text.lower()
-    if "trump" in lower_text:
-        hashtags.append("#Trump")
-    if "biden" in lower_text:
-        hashtags.append("#Biden")
-    if "ai" in lower_text:
-        hashtags.append("#AI")
-    if "senate" in lower_text or "congress" in lower_text:
-        hashtags.append("#Politics")
-    if "israel" in lower_text or "gaza" in lower_text or "putin" in lower_text or "ukraine" in lower_text:
-        hashtags.append("#World")
-    if "apple" in lower_text or "google" in lower_text:
-        hashtags.append("#Tech")
-    if "court" in lower_text or "judge" in lower_text:
-        hashtags.append("#Justice")
-    if "climate" in lower_text or "weather" in lower_text:
-        hashtags.append("#Climate")
-    return " ".join(hashtags[:3])
 
-async def fetch_news():
+def extract_keywords(text):
+    text = text.lower()
+    keywords = []
+    if "trump" in text:
+        keywords.append("#Trump")
+    if any(word in text for word in ["ukraine", "russia", "israel", "gaza", "war", "strike"]):
+        keywords.append("#World")
+    if any(word in text for word in ["ai", "artificial intelligence", "technology"]):
+        keywords.append("#AI")
+    if any(word in text for word in ["court", "trial", "judge", "charged"]):
+        keywords.append("#Justice")
+    return " ".join(keywords)
+
+
+async def summarize_article(url):
+    try:
+        article = Article(url)
+        article.download()
+        article.parse()
+        prompt = f"Summarize this news article in 2-4 sentences as a news brief for Telegram:
+
+Title: {article.title}
+
+Text: {article.text}"
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7
+        )
+        summary = response.choices[0].message.content.strip()
+        return summary
+    except Exception as e:
+        logging.warning(f"Error summarizing article: {e}")
+        return None
+
+
+async def send_news():
     sent_titles = load_sent_titles()
-    feed = feedparser.parse(FEED_URL)
-    new_titles = set()
+    new_posts = []
 
-    for entry in feed.entries[:10]:
-        title = entry.title.strip()
-        if title in sent_titles:
-            continue
+    for source, url in NEWS_FEEDS.items():
+        feed = feedparser.parse(url)
+        for entry in feed.entries:
+            if entry.title in sent_titles:
+                continue
+            summary = await summarize_article(entry.link)
+            if not summary:
+                continue
+            image_url = entry.get("media_content", [{}])[0].get("url") if "media_content" in entry else None
+            keywords = extract_keywords(entry.title + summary)
 
-        summary = entry.summary.strip()
-        source = entry.get("source", {}).get("title", "NY Times")
-        image_url = ""
-        if "media_content" in entry:
-            image_url = entry.media_content[0]["url"]
+            caption = f"<b>{entry.title}</b>
 
-        hashtags = extract_hashtags(title + " " + summary)
+{summary}
 
-        text = f"<b>{hbold(title)}</b>\n\n{summary}\n\n<i>{source}</i>\n{hashtags}"
+<i>{source}</i>
+{keywords}"
+            new_posts.append((caption, image_url))
+            sent_titles.add(entry.title)
+            if len(new_posts) >= 5:
+                break
+        if len(new_posts) >= 5:
+            break
 
+    for caption, image_url in new_posts:
         try:
             if image_url:
-                await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=text)
+                await bot.send_photo(CHANNEL_ID, photo=image_url, caption=caption)
             else:
-                await bot.send_message(chat_id=CHANNEL_ID, text=text)
-            new_titles.add(title)
-            await asyncio.sleep(3)
+                await bot.send_message(CHANNEL_ID, caption)
         except Exception as e:
-            print(f"Error sending news: {e}")
+            logging.warning(f"Failed to send news: {e}")
 
-    sent_titles.update(new_titles)
     save_sent_titles(sent_titles)
 
+
 async def main():
-    while True:
-        await fetch_news()
-        await asyncio.sleep(60)
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(send_news, "interval", minutes=1)
+    scheduler.start()
+    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
