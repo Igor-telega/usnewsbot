@@ -10,6 +10,8 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 import json
+from datetime import datetime, timedelta
+import time
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -30,6 +32,7 @@ RSS_FEEDS = {
 
 MAX_POSTS_PER_RUN = 5
 SENT_HASHES_FILE = "sent_titles.json"
+NEWS_MAX_AGE_HOURS = 24  # Сколько часов считаем новость "свежей"
 
 def load_sent_hashes():
     if not os.path.exists(SENT_HASHES_FILE):
@@ -88,12 +91,20 @@ async def fetch_and_send_news():
         feed = feedparser.parse(url)
         count = 0
         for entry in feed.entries:
+            # 1. Проверка возраста новости
+            published = getattr(entry, 'published_parsed', None)
+            if published:
+                news_time = datetime.fromtimestamp(time.mktime(published))
+                if datetime.utcnow() - news_time > timedelta(hours=NEWS_MAX_AGE_HOURS):
+                    continue  # новость слишком старая
+
+            # 2. Хеш для защиты от дублей
             summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
             news_hash = generate_hash(entry.title, summary)
-
             if news_hash in sent_hashes or news_hash in new_hashes:
                 continue
 
+            # 3. Генерация текста и хештегов
             try:
                 summarized = await summarize_article(entry.title, summary)
                 hashtags = await generate_hashtags(summarized)
@@ -102,6 +113,8 @@ async def fetch_and_send_news():
                 continue
 
             message = f"<b>{entry.title}</b>\n\n{summarized}\n\n<i>{source}</i>\n{hashtags}"
+
+            # 4. Обработка изображения
             image_url = None
             if "media_content" in entry and entry.media_content:
                 image_url = entry.media_content[0].get("url")
