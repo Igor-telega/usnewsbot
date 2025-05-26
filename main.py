@@ -1,88 +1,53 @@
 import logging
-import json
-import feedparser
 import os
+import requests
+import feedparser
 from aiogram import Bot, Dispatcher, types
-from aiogram.enums.parse_mode import ParseMode
-from aiogram.types import FSInputFile
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.utils.markdown import hlink
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram import F
+from aiogram.enums import ParseMode
+from aiogram.utils.markdown import hbold
+from dotenv import load_dotenv
 
-from openai import OpenAI
-from datetime import datetime
+load_dotenv()
 
-NEWS_FEED_URL = "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
-POSTED_TITLES_FILE = "/data/sent_titles.json"
-
-# Load environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML, session=AiohttpSession())
-dp = Dispatcher(storage=MemoryStorage())
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+def fetch_news():
+    url = f"https://newsapi.org/v2/top-headlines?country=us&apiKey={NEWS_API_KEY}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        articles = response.json().get("articles", [])
+        return articles
+    else:
+        print("Failed to fetch news:", response.status_code)
+        return []
 
-
-def load_posted_titles():
-    if os.path.exists(POSTED_TITLES_FILE):
-        with open(POSTED_TITLES_FILE, "r") as f:
-            data = json.load(f)
-            return set(data.get("titles", []))
-    return set()
-
-
-def save_posted_titles(titles):
-    with open(POSTED_TITLES_FILE, "w") as f:
-        json.dump({"titles": list(titles)}, f)
-
-
-def summarize(text):
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You summarize news headlines."},
-                {"role": "user", "content": f"Summarize this news in one short sentence: {text}"}
-            ]
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        logging.error(f"Error summarizing: {e}")
-        return None
-
-
-async def post_news():
-    feed = feedparser.parse(NEWS_FEED_URL)
-    posted_titles = load_posted_titles()
-
-    for entry in feed.entries[:5]:  # Limit to 5 latest
-        title = entry.title
-        link = entry.link
-
-        if title in posted_titles:
-            continue
-
-        summary = summarize(title)
-        if summary:
-            message = f"{hlink(title, link)}\n\n{summary}"
-            try:
-                await bot.send_message(chat_id=CHANNEL_ID, text=message)
-                posted_titles.add(title)
-            except Exception as e:
-                logging.error(f"Error sending news: {e}")
-
-    save_posted_titles(posted_titles)
-
+async def send_news():
+    articles = fetch_news()
+    for article in articles[:5]:  # Отправляем только 5 свежих новостей
+        title = article["title"]
+        url = article["url"]
+        caption = f"{hbold(title)}\n\n<a href='{url}'>Read more</a>"
+        try:
+            await bot.send_message(chat_id=CHANNEL_ID, text=caption)
+        except Exception as e:
+            logging.error("Error sending news:", exc_info=e)
 
 @dp.startup()
-async def on_startup(dispatcher: Dispatcher) -> None:
-    await post_news()
-
+async def on_startup(dispatcher):
+    await send_news()
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    dp.run_polling(bot)
+    import asyncio
+
+    async def main():
+        logging.basicConfig(level=logging.INFO)
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
+
+    asyncio.run(main())
