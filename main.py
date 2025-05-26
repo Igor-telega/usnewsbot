@@ -5,7 +5,7 @@ import logging
 import feedparser
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ParseMode
+from aiogram.enums import ParseMode
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -48,7 +48,6 @@ async def fetch_news():
         if title in sent_titles:
             continue
 
-        # Объединяем заголовок + краткое описание для отправки в ChatGPT
         full_text = f"{title}\n\n{summary}"
 
         try:
@@ -73,13 +72,12 @@ async def fetch_news():
             logging.exception("Error sending news:")
             continue
 
-    # Сохраняем новые заголовки, чтобы не дублировать
     save_sent_titles(sent_titles + new_titles)
 
 async def main():
     while True:
         await fetch_news()
-        await asyncio.sleep(600)  # 10 минут
+        await asyncio.sleep(600)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
