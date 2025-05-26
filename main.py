@@ -2,14 +2,13 @@ import asyncio
 import os
 import feedparser
 import requests
-import openai
+import hashlib
 from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher
 from aiogram.types import FSInputFile
-from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
-from datetime import datetime
 import json
 
 load_dotenv()
@@ -30,18 +29,22 @@ RSS_FEEDS = {
 }
 
 MAX_POSTS_PER_RUN = 5
-SENT_TITLES_FILE = "sent_titles.json"
+SENT_HASHES_FILE = "sent_titles.json"
 
-def load_sent_titles():
-    if not os.path.exists(SENT_TITLES_FILE):
+def load_sent_hashes():
+    if not os.path.exists(SENT_HASHES_FILE):
         return []
-    with open(SENT_TITLES_FILE, "r") as file:
+    with open(SENT_HASHES_FILE, "r") as file:
         data = json.load(file)
-        return data.get("titles", [])
+        return data.get("hashes", [])
 
-def save_sent_titles(titles):
-    with open(SENT_TITLES_FILE, "w") as file:
-        json.dump({"titles": titles}, file)
+def save_sent_hashes(hashes):
+    with open(SENT_HASHES_FILE, "w") as file:
+        json.dump({"hashes": hashes}, file)
+
+def generate_hash(title, summary):
+    combined = (title + summary).strip().lower()
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
 async def summarize_article(title, summary):
     prompt = f"""Summarize the following news article in 3–5 concise sentences in fluent English. Don't write that it's a news article or summary — just explain it in simple terms as if writing a news brief:
@@ -78,22 +81,19 @@ async def generate_image(prompt):
         return None
 
 async def fetch_and_send_news():
-    sent_titles = load_sent_titles()
-    new_titles = []
+    sent_hashes = load_sent_hashes()
+    new_hashes = []
 
     for source, url in RSS_FEEDS.items():
         feed = feedparser.parse(url)
         count = 0
         for entry in feed.entries:
-            if entry.title in sent_titles:
+            summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
+            news_hash = generate_hash(entry.title, summary)
+
+            if news_hash in sent_hashes or news_hash in new_hashes:
                 continue
 
-            summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
-            image_url = None
-            if "media_content" in entry and entry.media_content:
-                image_url = entry.media_content[0].get("url")
-
-            article_text = f"{entry.title}\n{summary}"
             try:
                 summarized = await summarize_article(entry.title, summary)
                 hashtags = await generate_hashtags(summarized)
@@ -102,43 +102,44 @@ async def fetch_and_send_news():
                 continue
 
             message = f"<b>{entry.title}</b>\n\n{summarized}\n\n<i>{source}</i>\n{hashtags}"
+            image_url = None
+            if "media_content" in entry and entry.media_content:
+                image_url = entry.media_content[0].get("url")
 
             try:
                 if image_url:
                     image_data = requests.get(image_url).content
                     with open("temp.jpg", "wb") as f:
                         f.write(image_data)
-                    photo = FSInputFile("temp.jpg")
-                    await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=message)
+                    await bot.send_photo(chat_id=CHANNEL_ID, photo=FSInputFile("temp.jpg"), caption=message)
                     os.remove("temp.jpg")
                 else:
-                    image_prompt = f"Realistic illustration related to: {entry.title}"
-                    img_link = await generate_image(image_prompt)
+                    img_prompt = f"Realistic illustration related to: {entry.title}"
+                    img_link = await generate_image(img_prompt)
                     if img_link:
                         img_data = requests.get(img_link).content
                         with open("temp.jpg", "wb") as f:
                             f.write(img_data)
-                        photo = FSInputFile("temp.jpg")
-                        await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=message)
+                        await bot.send_photo(chat_id=CHANNEL_ID, photo=FSInputFile("temp.jpg"), caption=message)
                         os.remove("temp.jpg")
                     else:
                         await bot.send_message(chat_id=CHANNEL_ID, text=message)
             except Exception as e:
-                print("Error sending message:", e)
+                print("Sending error:", e)
 
-            new_titles.append(entry.title)
+            new_hashes.append(news_hash)
             count += 1
             if count >= MAX_POSTS_PER_RUN:
                 break
 
-    save_sent_titles(sent_titles + new_titles)
+    save_sent_hashes(sent_hashes + new_hashes)
 
 async def main():
     while True:
         try:
             await fetch_and_send_news()
         except Exception as e:
-            print("Error in main loop:", e)
+            print("Main loop error:", e)
         await asyncio.sleep(60)
 
 if __name__ == "__main__":
