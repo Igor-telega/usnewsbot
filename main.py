@@ -2,6 +2,7 @@ import asyncio
 import os
 import feedparser
 import requests
+import hashlib
 from aiogram import Bot, Dispatcher
 from aiogram.types import FSInputFile
 from aiogram.enums import ParseMode
@@ -26,21 +27,24 @@ RSS_FEEDS = {
 }
 
 MAX_POSTS_PER_RUN = 5
-SENT_TITLES_FILE = "sent_titles.json"
+HASHES_FILE = "sent_hashes.json"
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-def load_sent_titles():
-    if not os.path.exists(SENT_TITLES_FILE):
-        return []
-    with open(SENT_TITLES_FILE, "r") as file:
-        data = json.load(file)
-        return data.get("titles", [])
+def load_sent_hashes():
+    if not os.path.exists(HASHES_FILE):
+        return set()
+    with open(HASHES_FILE, "r") as file:
+        return set(json.load(file))
 
-def save_sent_titles(titles):
-    with open(SENT_TITLES_FILE, "w") as file:
-        json.dump({"titles": titles}, file)
+def save_sent_hashes(hashes):
+    with open(HASHES_FILE, "w") as file:
+        json.dump(list(hashes), file)
+
+def make_news_hash(title, summary):
+    content = (title + summary).strip().lower().encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
 
 async def summarize_text(text):
     try:
@@ -57,23 +61,28 @@ async def summarize_text(text):
         return None
 
 async def fetch_and_send_news():
-    sent_titles = load_sent_titles()
-    new_titles = []
+    sent_hashes = load_sent_hashes()
+    new_hashes = set()
+    posts_sent = 0
 
     for source, url in RSS_FEEDS.items():
+        if posts_sent >= MAX_POSTS_PER_RUN:
+            break
         feed = feedparser.parse(url)
-        count = 0
+
         for entry in feed.entries:
-            if entry.title in sent_titles:
-                continue
             summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
+            news_hash = make_news_hash(entry.title, summary)
+
+            if news_hash in sent_hashes or news_hash in new_hashes:
+                continue
+
             image_url = None
             if "media_content" in entry and entry.media_content:
                 image_url = entry.media_content[0].get("url")
 
             summarized = await summarize_text(f"{entry.title}\n\n{summary}")
             if not summarized:
-                print(f"Skipping: OpenAI returned no summary for '{entry.title}'")
                 continue
 
             message = f"<b>{entry.title}</b>\n\n{summarized}\n\n<i>{source}</i>\n#AI #World"
@@ -91,12 +100,13 @@ async def fetch_and_send_news():
             except Exception as e:
                 print(f"Error sending message: {e}")
 
-            new_titles.append(entry.title)
-            count += 1
-            if count >= MAX_POSTS_PER_RUN:
+            new_hashes.add(news_hash)
+            posts_sent += 1
+
+            if posts_sent >= MAX_POSTS_PER_RUN:
                 break
 
-    save_sent_titles(sent_titles + new_titles)
+    save_sent_hashes(sent_hashes.union(new_hashes))
 
 async def main():
     while True:
