@@ -1,55 +1,84 @@
 import os
-import json
 import logging
-import requests
-import feedparser
 import asyncio
+import requests
+import json
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from aiogram.utils.markdown import hbold
+from aiogram.types.input_file import FSInputFile
+from openai import OpenAI
+from feedparser import parse
 from dotenv import load_dotenv
-import openai
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-openai.api_key = OPENAI_API_KEY
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-NEWS_FEEDS = [
+SOURCES = [
     "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
-    "http://feeds.bbci.co.uk/news/rss.xml",
     "http://rss.cnn.com/rss/edition.rss",
-    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
     "http://feeds.reuters.com/reuters/topNews",
-    "https://www.theguardian.com/world/rss",
     "https://www.npr.org/rss/rss.php?id=1001",
-    "https://apnews.com/rss"
+    "https://www.theguardian.com/world/rss"
 ]
 
-MAX_NEWS_PER_POST = 5
+TITLES_FILE = "sent_titles.json"
 
 def load_sent_titles():
-    try:
-        with open("sent_titles.json", "r") as f:
-            return set(json.load(f)["titles"])
-    except (FileNotFoundError, json.JSONDecodeError):
-        return set()
+    if os.path.exists(TITLES_FILE):
+        with open(TITLES_FILE, "r") as f:
+            return json.load(f).get("titles", [])
+    return []
 
 def save_sent_titles(titles):
-    with open("sent_titles.json", "w") as f:
-        json.dump({"titles": list(titles)}, f)
+    with open(TITLES_FILE, "w") as f:
+        json.dump({"titles": titles}, f)
+
+def get_articles():
+    articles = []
+    for source in SOURCES:
+        feed = parse(source)
+        for entry in feed.entries:
+            title = entry.title
+            summary = entry.summary if hasattr(entry, "summary") else ""
+            link = entry.link
+            image = ""
+            if "media_content" in entry:
+                image = entry.media_content[0]["url"]
+            elif "media_thumbnail" in entry:
+                image = entry.media_thumbnail[0]["url"]
+            articles.append({
+                "title": title,
+                "summary": summary,
+                "link": link,
+                "image": image,
+                "source": feed.feed.title
+            })
+    return articles
+
+def extract_hashtags(text):
+    hashtags = []
+    if "Trump" in text:
+        hashtags.append("#Trump")
+    if "AI" in text or "artificial intelligence" in text:
+        hashtags.append("#AI")
+    if "World" in text or "Ukraine" in text or "Gaza" in text:
+        hashtags.append("#World")
+    if "Justice" in text or "court" in text:
+        hashtags.append("#Justice")
+    return " ".join(hashtags)
 
 async def summarize_text(text):
     prompt = f"Summarize this news article in 2–4 sentences as a news brief for Telegram:\n\n{text[:3000]}"
     try:
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "user", "content": prompt}
@@ -57,50 +86,40 @@ async def summarize_text(text):
             temperature=0.7,
             max_tokens=350,
         )
-        return response["choices"][0]["message"]["content"].strip()
+        return response.choices[0].message.content.strip()
     except Exception as e:
         logging.error(f"OpenAI error: {e}")
         return None
 
-async def fetch_news():
+async def send_news():
     sent_titles = load_sent_titles()
-    new_titles = set()
-    posts_sent = 0
+    articles = get_articles()
+    new_articles = [a for a in articles if a["title"] not in sent_titles][:5]
 
-    for url in NEWS_FEEDS:
-        feed = feedparser.parse(url)
-        for entry in feed.entries:
-            title = entry.title
-            if title in sent_titles:
-                continue
-            link = entry.link
-            summary = entry.get("summary", "")
-            full_text = f"{title}. {summary}"
-            shortened = await summarize_text(full_text)
-            if not shortened:
-                continue
+    for article in new_articles:
+        summary = await summarize_text(article["summary"])
+        if not summary:
+            continue
 
-            hashtags = " ".join([f"#{tag.strip().replace(' ', '')}" for tag in entry.get("tags", [])[:3]]) if entry.get("tags") else ""
+        hashtags = extract_hashtags(article["title"] + " " + summary)
+        caption = f"<b>{article['title']}</b>\n\n{summary}\n\n<i>{article['source']}</i>\n{hashtags}"
 
-            message = f"<b>{hbold(title)}</b>\n\n{shortened}\n\n<i>{entry.get('source', {}).get('title', 'News')}</i>\n{hashtags}"
-            try:
-                await bot.send_message(chat_id=CHANNEL_ID, text=message)
-                new_titles.add(title)
-                posts_sent += 1
-                if posts_sent >= MAX_NEWS_PER_POST:
-                    break
-            except Exception as e:
-                logging.error(f"Failed to send message: {e}")
-        if posts_sent >= MAX_NEWS_PER_POST:
-            break
+        try:
+            if article["image"]:
+                await bot.send_photo(chat_id=CHANNEL_ID, photo=article["image"], caption=caption)
+            else:
+                await bot.send_message(chat_id=CHANNEL_ID, text=caption)
+            sent_titles.append(article["title"])
+        except Exception as e:
+            logging.error(f"Failed to send news: {e}")
 
-    sent_titles.update(new_titles)
     save_sent_titles(sent_titles)
 
 async def main():
     while True:
-        await fetch_news()
-        await asyncio.sleep(60)
+        await send_news()
+        await asyncio.sleep(60)  # Check every 60 seconds
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
