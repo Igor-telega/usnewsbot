@@ -1,173 +1,130 @@
-import asyncio
 import os
-import feedparser
-import requests
-import hashlib
-from openai import AsyncOpenAI
-from aiogram import Bot, Dispatcher
-from aiogram.types import FSInputFile
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from dotenv import load_dotenv
-import json
-from datetime import datetime, timedelta
 import time
+import requests
+import json
+import feedparser
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, types
+from aiogram.enums import ParseMode
+from embeddings_storage import is_duplicate, save_embedding
+from openai import OpenAI
 
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-RSS_FEEDS = {
-    "NYT": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
-    "CNN": "http://rss.cnn.com/rss/cnn_topstories.rss",
-    "Reuters": "http://feeds.reuters.com/reuters/topNews",
-    "AP": "https://apnews.com/rss",
-    "The Guardian": "https://www.theguardian.com/world/rss"
-}
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-MAX_POSTS_PER_RUN = 5
-SENT_HASHES_FILE = "sent_titles.json"
-NEWS_MAX_AGE_HOURS = 24  # Maximum news age in hours
+SOURCES = [
+    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+    "https://www.theguardian.com/world/rss",
+    "http://rss.cnn.com/rss/edition_world.rss"
+]
 
-def load_sent_hashes():
-    if not os.path.exists(SENT_HASHES_FILE):
-        return []
-    with open(SENT_HASHES_FILE, "r") as file:
-        data = json.load(file)
-        return data.get("hashes", [])
-
-def save_sent_hashes(hashes):
-    with open(SENT_HASHES_FILE, "w") as file:
-        json.dump({"hashes": hashes}, file)
-
-def generate_hash(title, summary):
-    combined = (title + summary).strip().lower()
-    return hashlib.sha256(combined.encode("utf-8")).hexdigest()
-
-def format_publish_date(published):
+def get_article_date(entry):
     try:
-        date = datetime.fromtimestamp(time.mktime(published))
-        return date.strftime("%B %d, %Y")
-    except:
-        return None
+        published = entry.get("published_parsed")
+        if published:
+            return datetime(*published[:6])
+    except Exception:
+        pass
+    return None
 
-async def summarize_article(title, summary):
-    prompt = f"""Summarize the following news article in 3–5 concise sentences in fluent English. Don't write that it's a news article or summary — just explain it in simple terms as if writing a news brief:
+def is_recent(entry, hours=24):
+    article_date = get_article_date(entry)
+    if article_date:
+        return datetime.utcnow() - article_date <= timedelta(hours=hours)
+    return False
 
-Title: {title}
-Text: {summary}"""
-    response = await client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content.strip()
+def extract_image(entry):
+    media_content = entry.get("media_content")
+    if media_content and isinstance(media_content, list):
+        return media_content[0].get("url")
+    if "image" in entry:
+        return entry["image"]
+    return None
 
-async def generate_hashtags(text):
-    prompt = f"""Suggest 2–3 relevant English hashtags for the following news summary. Only return hashtags separated by spaces. No hashtags like #news or #breaking — be more specific.
-
-Text: {text}"""
-    response = await client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content.strip()
-
-async def generate_image(prompt):
+def extract_tags(text, max_tags=3):
     try:
-        image_resp = await client.images.generate(
-            model="dall-e-3",
-            prompt=prompt,
-            n=1,
-            size="1024x1024"
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "Generate 3 concise, relevant hashtags based on the topic of the article. Respond only with hashtags, space-separated."},
+                {"role": "user", "content": text}
+            ],
+            temperature=0.7
         )
-        return image_resp.data[0].url
+        tags_line = response.choices[0].message.content.strip()
+        tags = tags_line.replace("#", "").split()
+        return ["#" + tag for tag in tags[:max_tags]]
     except Exception as e:
-        print("Image generation error:", e)
-        return None
+        print(f"Ошибка при генерации хэштегов: {e}")
+        return []
 
-async def fetch_and_send_news():
-    sent_hashes = load_sent_hashes()
-    new_hashes = []
+def embed_title(title):
+    response = client.embeddings.create(
+        input=title,
+        model="text-embedding-ada-002"
+    )
+    return response.data[0].embedding
 
-    for source, url in RSS_FEEDS.items():
+def create_caption(entry, source_name, tags, published_date):
+    caption = f"<b>{entry.get('title')}</b>\n\n"
+    caption += f"{entry.get('summary')}\n\n"
+    caption += f"<b>Source:</b> <a href='{entry.get('link')}'>Link</a>\n"
+    caption += f"🕒 <i>Published: {published_date.strftime('%B %d, %Y')}</i>\n"
+    caption += f"<i>{source_name}</i>\n"
+    caption += " ".join(tags)
+    return caption
+
+def extract_source_name(feed_url):
+    if "nytimes" in feed_url:
+        return "NYT"
+    elif "guardian" in feed_url:
+        return "The Guardian"
+    elif "cnn" in feed_url:
+        return "CNN"
+    return "Unknown"
+
+def fetch_and_post():
+    for url in SOURCES:
         feed = feedparser.parse(url)
-        count = 0
         for entry in feed.entries:
-            # 1. Filter old news
-            published = getattr(entry, 'published_parsed', None)
-            if published:
-                news_time = datetime.fromtimestamp(time.mktime(published))
-                if datetime.utcnow() - news_time > timedelta(hours=NEWS_MAX_AGE_HOURS):
-                    continue
-            else:
-                news_time = datetime.utcnow()
-
-            formatted_date = format_publish_date(published)
-
-            # 2. Generate hash
-            summary = getattr(entry, 'summary', '') or getattr(entry, 'description', '')
-            news_hash = generate_hash(entry.title, summary)
-            if news_hash in sent_hashes or news_hash in new_hashes:
+            if not is_recent(entry):
                 continue
 
-            try:
-                summarized = await summarize_article(entry.title, summary)
-                hashtags = await generate_hashtags(summarized)
-            except Exception as e:
-                print("OpenAI summarization error:", e)
+            title = entry.get("title", "")
+            embedding = embed_title(title)
+
+            if is_duplicate(embedding):
+                print(f"Пропущено как дубликат: {title}")
                 continue
 
-            # 3. Compose message
-            message = f"<b>{entry.title}</b>\n\n{summarized}\n\n"
-            if formatted_date:
-                message += f"🕒 <i>Published: {formatted_date}</i>\n"
-            message += f"<i>{source}</i>\n{hashtags}"
+            save_embedding(title, embedding)
 
-            # 4. Send message
-            image_url = None
-            if "media_content" in entry and entry.media_content:
-                image_url = entry.media_content[0].get("url")
+            summary = entry.get("summary", "")
+            text_for_tags = f"{title}\n{summary}"
+            tags = extract_tags(text_for_tags)
+
+            image_url = extract_image(entry)
+            source_name = extract_source_name(url)
+            published_date = get_article_date(entry) or datetime.utcnow()
+            caption = create_caption(entry, source_name, tags, published_date)
 
             try:
                 if image_url:
-                    image_data = requests.get(image_url).content
-                    with open("temp.jpg", "wb") as f:
-                        f.write(image_data)
-                    await bot.send_photo(chat_id=CHANNEL_ID, photo=FSInputFile("temp.jpg"), caption=message)
-                    os.remove("temp.jpg")
+                    bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=caption)
                 else:
-                    img_prompt = f"Realistic illustration related to: {entry.title}"
-                    img_link = await generate_image(img_prompt)
-                    if img_link:
-                        img_data = requests.get(img_link).content
-                        with open("temp.jpg", "wb") as f:
-                            f.write(img_data)
-                        await bot.send_photo(chat_id=CHANNEL_ID, photo=FSInputFile("temp.jpg"), caption=message)
-                        os.remove("temp.jpg")
-                    else:
-                        await bot.send_message(chat_id=CHANNEL_ID, text=message)
+                    bot.send_message(chat_id=CHANNEL_ID, text=caption)
+                time.sleep(2)
             except Exception as e:
-                print("Sending error:", e)
-
-            new_hashes.append(news_hash)
-            count += 1
-            if count >= MAX_POSTS_PER_RUN:
-                break
-
-    save_sent_hashes(sent_hashes + new_hashes)
-
-async def main():
-    while True:
-        try:
-            await fetch_and_send_news()
-        except Exception as e:
-            print("Main loop error:", e)
-        await asyncio.sleep(60)
+                print(f"Ошибка при отправке: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    fetch_and_post()
