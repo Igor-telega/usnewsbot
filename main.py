@@ -1,148 +1,125 @@
-import os
 import json
-import time
 import logging
-import requests
+import asyncio
 import feedparser
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils.markdown import hbold
-from aiogram.types import InputFile
-from aiogram.enums import ParseMode
-from openai import OpenAI
-from dotenv import load_dotenv
+import openai
+import os
+from aiogram import Bot, types
+from aiogram.types import URLInputFile
+from datetime import datetime
+import time
 
-load_dotenv()
-
+# Настройки
+openai.api_key = os.getenv("OPENAI_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+CHANNEL_ID = "@usnewsdailytestchannel"
 
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
-dp = Dispatcher()
-client = OpenAI(api_key=OPENAI_API_KEY)
+# RSS-источники
+RSS_FEEDS = [
+    "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+    "http://feeds.bbci.co.uk/news/rss.xml",
+    "http://rss.cnn.com/rss/cnn_topstories.rss",
+    "https://feeds.npr.org/1001/rss.xml",
+    "https://www.reutersagency.com/feed/?best-topics=top-news&post_type=best",
+    "https://www.theguardian.com/world/rss"
+]
 
-RSS_FEEDS = {
-    "NYT": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
-    "CNN": "http://rss.cnn.com/rss/edition.rss",
-    "Reuters": "http://feeds.reuters.com/reuters/topNews",
-    "AP": "https://rss.apnews.com/apf-topnews",
-    "NPR": "https://feeds.npr.org/1001/rss.xml",
-    "Guardian": "https://www.theguardian.com/world/rss"
-}
+# Ограничения
+POST_LIMIT = 5
+SUMMARY_PROMPT = "Summarize this news article in 2-4 sentences as a news brief for Telegram:\n\n"
 
-HASHTAG_MAP = {
-    "politics": "#Politics",
-    "trump": "#Trump",
-    "biden": "#Biden",
-    "ukraine": "#Ukraine",
-    "israel": "#Israel",
-    "gaza": "#Gaza",
-    "china": "#China",
-    "russia": "#Russia",
-    "election": "#Elections",
-    "ai": "#AI",
-    "world": "#World",
-    "book": "#Books",
-    "summer": "#Lifestyle"
-}
+# Инициализация бота
+bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 
-def load_sent_titles():
-    try:
-        with open("sent_titles.json", "r") as f:
-            return json.load(f)["titles"]
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+# Загрузка опубликованных заголовков
+if os.path.exists("sent_titles.json"):
+    with open("sent_titles.json", "r") as f:
+        sent_titles = json.load(f).get("titles", [])
+else:
+    sent_titles = []
 
-def save_sent_titles(titles):
+# Сохранение новых заголовков
+def save_titles():
     with open("sent_titles.json", "w") as f:
-        json.dump({"titles": titles[-50:]}, f, indent=2)
+        json.dump({"titles": sent_titles}, f)
 
-def generate_hashtags(title):
-    hashtags = []
-    lowered = title.lower()
-    for keyword, tag in HASHTAG_MAP.items():
-        if keyword in lowered:
-            hashtags.append(tag)
-    return " ".join(hashtags)
-
-def fetch_image(entry):
+# Генерация краткого текста через OpenAI
+async def summarize_article(text):
     try:
-        if "media_content" in entry:
-            return entry.media_content[0]["url"]
-        elif "media_thumbnail" in entry:
-            return entry.media_thumbnail[0]["url"]
-        elif "links" in entry:
-            for link in entry.links:
-                if link["type"].startswith("image"):
-                    return link["href"]
-    except Exception:
+        response = await openai.ChatCompletion.acreate(
+            model="gpt-4",
+            messages=[{"role": "user", "content": SUMMARY_PROMPT + text}]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error(f"OpenAI error: {e}")
         return None
-    return None
 
-def summarize(text):
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        temperature=0.6,
-        messages=[
-            {"role": "system", "content": "You summarize news articles in 2–4 sentences for Telegram."},
-            {"role": "user", "content": f"Summarize this news article in 2–4 sentences as a news brief for Telegram:\n\n{text}"}
-        ]
-    )
-    return response.choices[0].message.content.strip()
-
-async def post_news():
-    sent_titles = load_sent_titles()
+# Получение и публикация новостей
+async def fetch_and_post():
     posted = 0
-
-    for source, url in RSS_FEEDS.items():
-        if posted >= 5:
+    for feed_url in RSS_FEEDS:
+        if posted >= POST_LIMIT:
             break
-
-        feed = feedparser.parse(url)
-
+        feed = feedparser.parse(feed_url)
         for entry in feed.entries:
-            title = entry.title.strip()
+            if posted >= POST_LIMIT:
+                break
+            title = entry.title
+            link = entry.link
+            summary = entry.get("summary", "")
+            media_url = None
+
             if title in sent_titles:
                 continue
 
-            summary_text = summarize(entry.title + "\n\n" + entry.get("summary", ""))
-            image_url = fetch_image(entry)
-            hashtags = generate_hashtags(title)
-            source_name = f"<i>{source} > Top Stories</i>"
+            # Поиск изображения
+            if "media_content" in entry:
+                media_url = entry.media_content[0].get("url")
+            elif "links" in entry:
+                for link_obj in entry.links:
+                    if link_obj.type.startswith("image"):
+                        media_url = link_obj.href
+                        break
 
-            caption = f"<b>{title}</b>\n\n{summary_text}\n\n{source_name}"
-            if hashtags:
-                caption += f"\n{hashtags}"
+            # Получение краткого текста
+            brief = await summarize_article(summary)
+            if not brief:
+                continue
 
-            if image_url:
-                try:
-                    img_data = requests.get(image_url, timeout=5).content
-                    with open("temp.jpg", "wb") as f:
-                        f.write(img_data)
-                    photo = InputFile("temp.jpg")
+            # Хэштеги
+            hashtags = []
+            if "trump" in title.lower():
+                hashtags.append("#Trump")
+            if "ai" in title.lower() or "artificial intelligence" in summary.lower():
+                hashtags.append("#AI")
+            if "russia" in title.lower() or "ukraine" in title.lower():
+                hashtags.append("#World")
+            if "justice" in title.lower():
+                hashtags.append("#Justice")
+
+            caption = f"<b>{title}</b>\n\n{brief}\n\n<i>{feed.feed.title}</i>\n{' '.join(hashtags)}"
+
+            try:
+                if media_url:
+                    photo = URLInputFile(media_url)
                     await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=caption)
-                    os.remove("temp.jpg")
-                except Exception as e:
-                    logging.warning(f"Image failed: {e}")
+                else:
                     await bot.send_message(chat_id=CHANNEL_ID, text=caption)
-            else:
-                await bot.send_message(chat_id=CHANNEL_ID, text=caption)
+                sent_titles.append(title)
+                save_titles()
+                posted += 1
+                await asyncio.sleep(2)
+            except Exception as e:
+                logging.warning(f"Failed to send message: {e}")
 
-            sent_titles.append(title)
-            posted += 1
-            if posted >= 5:
-                break
-
-    save_sent_titles(sent_titles)
-
-async def main_loop():
+# Цикл
+async def scheduler():
     while True:
-        try:
-            await post_news()
-        except Exception as e:
-            logging.error(f"Main loop error: {e}")
-        await asyncio.sleep(60)  # Every 60 seconds
+        await fetch_and_post()
+        await asyncio.sleep(60)
 
+# Запуск
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main_loop())
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(scheduler())
