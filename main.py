@@ -46,12 +46,36 @@ def make_news_hash(title, summary):
     content = (title + summary).strip().lower().encode("utf-8")
     return hashlib.sha256(content).hexdigest()
 
+def classify_hashtags(title, summary):
+    text = (title + " " + summary).lower()
+
+    tags = []
+
+    if any(word in text for word in ["election", "biden", "trump", "senate", "government", "republican", "democrat"]):
+        tags.extend(["#Politics", "#USA"])
+    if any(word in text for word in ["economy", "inflation", "stock", "market", "finance", "bank", "budget"]):
+        tags.extend(["#Economy", "#Business"])
+    if any(word in text for word in ["ai", "artificial intelligence", "technology", "robot", "innovation"]):
+        tags.extend(["#Tech", "#AI"])
+    if any(word in text for word in ["covid", "vaccine", "hospital", "health", "cdc"]):
+        tags.extend(["#Health"])
+    if any(word in text for word in ["storm", "hurricane", "flood", "earthquake", "wildfire", "weather"]):
+        tags.extend(["#Weather"])
+    if any(word in text for word in ["crime", "shooting", "murder", "police", "arrest", "attack"]):
+        tags.extend(["#Crime"])
+    if any(word in text for word in ["russia", "ukraine", "israel", "china", "nato", "iran", "war", "diplomacy"]):
+        tags.extend(["#World", "#Conflict"])
+    if not tags:
+        tags.append("#News")
+
+    return list(set(tags))[:3]
+
 async def summarize_text(text):
     try:
         chat_response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a news summarizer. Write in English, 3-5 sentences, informative, as if for a news feed. Don't just say what the article is about — tell the story."},
+                {"role": "system", "content": "You are a news summarizer. Write in English, 3–5 sentences, informative, concise, and engaging."},
                 {"role": "user", "content": text}
             ]
         )
@@ -85,7 +109,8 @@ async def fetch_and_send_news():
             if not summarized:
                 continue
 
-            message = f"<b>{entry.title}</b>\n\n{summarized}\n\n<i>{source}</i>\n#AI #World"
+            hashtags = " ".join(classify_hashtags(entry.title, summary))
+            message = f"<b>{entry.title}</b>\n\n{summarized}\n\n<i>{source}</i>\n{hashtags}"
 
             try:
                 if image_url:
