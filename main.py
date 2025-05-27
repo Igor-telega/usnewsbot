@@ -67,7 +67,6 @@ async def summarize_article(title, content, source):
 
 async def post_to_channel(article):
     title = article["title"]
-    link = article["link"]
     summary = await summarize_article(title, article.get("summary", ""), article["source"])
     if not summary:
         return
@@ -82,10 +81,16 @@ async def post_to_channel(article):
     try:
         image_prompt = f"Photorealistic image for a news headline: {title}. Context: {summary[:150]}"
         image_data = generate_image(image_prompt)
-        if isinstance(image_data, dict) and "data" in image_data and isinstance(image_data["data"], list):
-            image_url = image_data["data"][0].get("url")
+
+        # Явная проверка структуры image_data
+        if isinstance(image_data, dict):
+            data_list = image_data.get("data")
+            if isinstance(data_list, list) and len(data_list) > 0:
+                image_url = data_list[0].get("url")
+
     except Exception as e:
         logging.error(f"Error generating image: {e}")
+        image_url = None
 
     # Формат поста
     date_str = article["published"].strftime('%Y-%m-%d %H:%M UTC')
