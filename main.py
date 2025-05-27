@@ -1,119 +1,107 @@
 import os
-import time
-import asyncio
-import logging
-import requests
+import json
 import feedparser
+import asyncio
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-
+from aiogram.client.default import DefaultBotProperties
+from dotenv import load_dotenv
 from embeddings_storage import is_duplicate, save_embedding
-from openai import OpenAI
-from openai import OpenAIError
+import openai
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-if not TELEGRAM_TOKEN or not CHANNEL_ID or not OPENAI_API_KEY:
-    raise ValueError("Missing TELEGRAM_TOKEN, CHANNEL_ID, or OPENAI_API_KEY in .env")
-
-bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai.api_key = OPENAI_API_KEY
 
-NEWS_SOURCES = [
-    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-    "http://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://www.aljazeera.com/xml/rss/all.xml",
-    "https://rss.cnn.com/rss/edition_world.rss",
-    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
-    "https://www.theguardian.com/world/rss",
+SENT_TITLES_FILE = "sent_titles.json"
+NEWS_FEEDS = [
+    "http://rss.cnn.com/rss/edition.rss",
+    "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+    "https://feeds.bbci.co.uk/news/rss.xml",
+    "https://www.theguardian.com/world/rss"
 ]
 
-sent_titles = set()
-MAX_ARTICLES = 30
-MAX_AGE_HOURS = 24
+MAX_NEWS_AGE_HOURS = 24
 
-def fetch_articles():
-    articles = []
-    for url in NEWS_SOURCES:
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:MAX_ARTICLES]:
-            title = entry.get("title", "")
-            link = entry.get("link", "")
-            published = entry.get("published", "")
-            try:
-                published_time = datetime(*entry.published_parsed[:6])
-            except Exception:
-                published_time = datetime.utcnow()
-            if datetime.utcnow() - published_time > timedelta(hours=MAX_AGE_HOURS):
+def load_sent_titles():
+    if os.path.exists(SENT_TITLES_FILE):
+        with open(SENT_TITLES_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+def save_sent_titles(titles):
+    with open(SENT_TITLES_FILE, "w") as f:
+        json.dump(list(titles), f)
+
+async def get_embedding(text):
+    response = openai.Embedding.create(
+        model="text-embedding-ada-002",
+        input=text
+    )
+    return response["data"][0]["embedding"]
+
+def is_recent(entry):
+    if not hasattr(entry, "published_parsed"):
+        return False
+    published = datetime(*entry.published_parsed[:6])
+    return datetime.utcnow() - published <= timedelta(hours=MAX_NEWS_AGE_HOURS)
+
+async def send_news():
+    sent_titles = load_sent_titles()
+
+    for feed_url in NEWS_FEEDS:
+        feed = feedparser.parse(feed_url)
+        for entry in feed.entries:
+            title = entry.title
+            if title in sent_titles or not is_recent(entry):
                 continue
-            articles.append({
-                "title": title.strip(),
-                "link": link,
-                "published": published_time,
-                "source": feed.feed.get("title", "Unknown Source")
-            })
-    return articles
 
-def generate_summary(title, link):
-    try:
-        article = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a news editor."},
-                {"role": "user", "content": f"Summarize this news for Telegram in 3-4 sentences in English. Add 3 relevant hashtags below. Link: {link}"}
-            ]
-        )
-        return article.choices[0].message.content.strip()
-    except OpenAIError as e:
-        logging.error(f"OpenAI error: {e}")
-        return ""
+            description = entry.get("summary", "")
+            link = entry.link
+            published = datetime(*entry.published_parsed[:6]).strftime("%B %d, %Y")
+            source = feed.feed.get("title", "News Source")
 
-def get_embedding(text):
-    try:
-        response = client.embeddings.create(
-            model="text-embedding-3-small",
-            input=[text]
-        )
-        return response.data[0].embedding
-    except OpenAIError as e:
-        logging.error(f"Embedding error: {e}")
-        return []
+            full_text = f"{title}\n\n{description}"
+            embedding = await get_embedding(full_text)
 
-async def post_to_channel(article):
-    embedding = get_embedding(article["title"])
-    if not embedding or is_duplicate(embedding):
-        return
+            if is_duplicate(embedding):
+                continue
 
-    summary = generate_summary(article["title"], article["link"])
-    if not summary:
-        return
+            save_embedding(title, embedding)
 
-    msg = f"<b>{article['title']}</b>\n\n{summary}\n\nSource: {article['link']}\n\n" \
-          f"🕒 Published: {article['published'].strftime('%B %d, %Y')}\n<i>{article['source']}</i>"
-    await bot.send_message(CHANNEL_ID, msg)
-    save_embedding(article["title"], embedding)
+            hashtags = "#" + " #".join([
+                word.strip(".,!?").capitalize()
+                for word in title.split()
+                if word.isalpha() and len(word) > 3
+            ][:3])
+
+            message = (
+                f"<b>{title}</b>\n\n"
+                f"{description}\n"
+                f"<i>Source:</i> <a href=\"{link}\">{source}</a>\n\n"
+                f"🕓 <i>Published:</i> {published}\n"
+                f"{hashtags}"
+            )
+
+            await bot.send_message(chat_id=CHANNEL_ID, text=message, disable_web_page_preview=False)
+            sent_titles.add(title)
+
+    save_sent_titles(sent_titles)
 
 async def main():
     while True:
         try:
-            articles = fetch_articles()
-            for article in articles:
-                if article["title"] in sent_titles:
-                    continue
-                await post_to_channel(article)
-                sent_titles.add(article["title"])
-                await asyncio.sleep(5)
+            await send_news()
         except Exception as e:
-            logging.error(f"Unexpected error: {e}")
-        await asyncio.sleep(1800)
+            print(f"Error: {e}")
+        await asyncio.sleep(60)
 
 if __name__ == "__main__":
     asyncio.run(main())
