@@ -3,13 +3,13 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
-import requests
 import openai
-from dotenv import load_dotenv
-from feedparser import parse
+import requests
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.types import InputFile
+from dotenv import load_dotenv
+from feedparser import parse
 from embeddings import get_embedding, is_duplicate, save_embedding
 from image_gen import generate_image
 
@@ -19,53 +19,57 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+openai.api_key = OPENAI_API_KEY
+logging.basicConfig(level=logging.INFO)
+
 bot = Bot(token=BOT_TOKEN, default=ParseMode.HTML)
 dp = Dispatcher()
 
-openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
-
-logging.basicConfig(level=logging.INFO)
-
+# Источники
 rss_feeds = {
     "NY Times": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
     "Reuters": "http://feeds.reuters.com/reuters/topNews",
     "CNN": "http://rss.cnn.com/rss/cnn_topstories.rss",
-    "AP": "https://apnews.com/rss",
+    "AP News": "https://apnews.com/rss",
     "The Guardian": "https://www.theguardian.com/world/rss",
     "NPR": "https://feeds.npr.org/1001/rss.xml"
 }
 
-MAX_TOTAL_POSTS = 5
+MAX_PER_SOURCE = 1
+TIME_LIMIT_HOURS = 1
+SENT_TITLES_FILE = "sent_titles.json"
 
 def load_sent_titles():
     try:
-        with open("sent_titles.json", "r") as f:
+        with open(SENT_TITLES_FILE, "r") as f:
             return json.load(f)["titles"]
     except FileNotFoundError:
         return []
 
 def save_sent_titles(titles):
-    with open("sent_titles.json", "w") as f:
+    with open(SENT_TITLES_FILE, "w") as f:
         json.dump({"titles": titles}, f)
 
 async def summarize_article(title, content, source):
     try:
         messages = [
-            {"role": "system", "content": "Ты профессиональный американский новостной редактор. Пиши кратко, понятно, информативно, в 5-10 предложениях. Без ссылок. Без призывов."},
-            {"role": "user", "content": f"Сделай краткое журналистское описание новости под названием '{title}' из источника {source}. Вот содержание:\n\n{content}"}
+            {"role": "system", "content": "You are a professional news editor writing for an American audience. Write a concise, neutral, journalistic summary of the article in 6-10 sentences."},
+            {"role": "user", "content": f"Title: {title}\nSource: {source}\nContent:\n{content}"}
         ]
-        response = openai_client.chat.completions.create(
+
+        response = await openai.ChatCompletion.acreate(
             model="gpt-4",
             messages=messages,
             temperature=0.7
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logging.error(f"Error summarizing article: {e}")
+        logging.error(f"Error with summary: {e}")
         return None
 
 async def post_to_channel(article):
     title = article["title"]
+    link = article["link"]
     summary = await summarize_article(title, article.get("summary", ""), article["source"])
     if not summary:
         return
@@ -73,72 +77,67 @@ async def post_to_channel(article):
     embedding = get_embedding(summary)
     if is_duplicate(embedding, "embeddings_storage.py"):
         return
-
     save_embedding(title, embedding)
 
-    published_date = article["published"].strftime("%B %d, %Y %H:%M")
-    content = f"<b>{title}</b>\n\n{summary}\n\n<i>{article['source']} — {published_date}</i>"
-
-    image_url = None
     try:
-        image_url = generate_image(title)
+        image_prompt = f"News: {title}"
+        image_url = generate_image(image_prompt)
     except Exception as e:
         logging.error(f"Error generating image: {e}")
+        image_url = None
+
+    date_str = article["published"].strftime('%Y-%m-%d %H:%M UTC')
+    message = f"<b>{title}</b>\n\n{summary}\n\n<i>{article['source']} | {date_str}</i>\n#News #AI"
 
     try:
         if image_url:
-            img_data = requests.get(image_url).content
-            with open("temp.jpg", "wb") as f:
-                f.write(img_data)
-            await bot.send_photo(chat_id=CHANNEL_ID, photo=InputFile("temp.jpg"), caption=content)
-            os.remove("temp.jpg")
+            await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=message)
         else:
-            await bot.send_message(chat_id=CHANNEL_ID, text=content)
+            await bot.send_message(chat_id=CHANNEL_ID, text=message)
     except Exception as e:
         logging.error(f"Error posting to Telegram: {e}")
 
 async def main():
     sent_titles = load_sent_titles()
     articles_by_source = {source: [] for source in rss_feeds}
-    now = datetime.utcnow()
-    time_limit = now - timedelta(hours=10)
 
-    # Сбор свежих новостей
+    now = datetime.utcnow()
+    limit_time = now - timedelta(hours=TIME_LIMIT_HOURS)
+
     for source, url in rss_feeds.items():
         feed = parse(url)
         for entry in feed.entries:
-            pub_time = entry.get("published_parsed")
-            if not pub_time:
+            published_parsed = entry.get("published_parsed")
+            if not published_parsed:
                 continue
-            published_dt = datetime(*pub_time[:6])
-            if published_dt < time_limit:
+            published_dt = datetime(*published_parsed[:6])
+            if published_dt < limit_time:
                 continue
-            if entry.title in sent_titles:
-                continue
-            articles_by_source[source].append({
+            article = {
                 "title": entry.title,
-                "summary": entry.get("summary", ""),
                 "link": entry.link,
-                "source": source,
-                "published": published_dt
-            })
+                "summary": entry.get("summary", ""),
+                "published": published_dt,
+                "source": source
+            }
+            articles_by_source[source].append(article)
 
-    # Чередование по источникам
-    combined = []
+    # Публикация по очереди из разных источников
+    all_articles = []
     max_len = max(len(arts) for arts in articles_by_source.values())
     for i in range(max_len):
-        for source in rss_feeds:
-            if i < len(articles_by_source[source]):
-                combined.append(articles_by_source[source][i])
-            if len(combined) >= MAX_TOTAL_POSTS:
-                break
-        if len(combined) >= MAX_TOTAL_POSTS:
-            break
+        for source, articles in articles_by_source.items():
+            if i < len(articles):
+                all_articles.append(articles[i])
 
-    for article in combined:
-        await post_to_channel(article)
-        sent_titles.append(article["title"])
-        await asyncio.sleep(5)
+    count_by_source = {s: 0 for s in rss_feeds}
+    for article in all_articles:
+        source = article["source"]
+        if article["title"] not in sent_titles and count_by_source[source] < MAX_PER_SOURCE:
+            await post_to_channel(article)
+            sent_titles.append(article["title"])
+            count_by_source[source] += 1
+            await asyncio.sleep(5)
 
     save_sent_titles(sent_titles)
 
