@@ -77,23 +77,23 @@ async def post_to_channel(article):
         return
     save_embedding(title, embedding)
 
+    # Генерация изображения
     image_url = None
     try:
-        image_prompt = f"News: {title}"
+        image_prompt = f"Photorealistic image for a news headline: {title}. Context: {summary[:150]}"
         image_data = generate_image(image_prompt)
         if isinstance(image_data, dict) and "data" in image_data and isinstance(image_data["data"], list):
             image_url = image_data["data"][0].get("url")
-        else:
-            image_url = None
     except Exception as e:
         logging.error(f"Error generating image: {e}")
-        image_url = None
 
+    # Формат поста
     date_str = article["published"].strftime('%Y-%m-%d %H:%M UTC')
     message = f"<b>{title}</b>\n\n{summary}\n\n<i>{article['source']} | {date_str}</i>\n#News #AI"
 
+    # Отправка в Telegram
     try:
-        if image_url and isinstance(image_url, str):
+        if isinstance(image_url, str) and image_url.startswith("http"):
             await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=message)
         else:
             await bot.send_message(chat_id=CHANNEL_ID, text=message)
@@ -125,6 +125,7 @@ async def main():
             }
             articles_by_source[source].append(article)
 
+    # Чередуем источники
     all_articles = []
     max_len = max(len(arts) for arts in articles_by_source.values())
     for i in range(max_len):
@@ -132,6 +133,7 @@ async def main():
             if i < len(articles):
                 all_articles.append(articles[i])
 
+    # Публикация
     count_by_source = {s: 0 for s in rss_feeds}
     for article in all_articles:
         source = article["source"]
