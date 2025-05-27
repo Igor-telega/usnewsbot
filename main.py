@@ -54,13 +54,9 @@ def count_tokens(text):
 async def summarize(title, content, source):
     prompt = (
         f"Summarize the news article from {source} with the title:"
-        f""{title}"
-
-"
+        f""{title}""
         f"Content:
-"{content}"
-
-"
+"{content}""
         "Write a short news-style summary for an American audience in 7-10 sentences. "
         "Keep it neutral and journalistic. If the title is already a headline, do not repeat it. "
         "Do not include any URLs or source names."
