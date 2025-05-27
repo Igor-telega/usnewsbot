@@ -1,139 +1,104 @@
-import asyncio
 import os
-import feedparser
-import requests
+import asyncio
+import json
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from aiogram.types import InputFile
-from dotenv import load_dotenv
-from datetime import datetime, timedelta
-import json
+from aiogram.client.default import DefaultBotProperties
+import feedparser
 import openai
-from embeddings import is_duplicate, save_embedding
+from embeddings import get_embedding, is_duplicate, save_embedding
+from image_gen import generate_image
 
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai.api_key = OPENAI_API_KEY
 
-RSS_FEEDS = {
-    "NYT": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
-    "CNN": "http://rss.cnn.com/rss/cnn_topstories.rss",
-    "Reuters": "http://feeds.reuters.com/reuters/topNews",
-    "AP": "https://apnews.com/rss",
-    "The Guardian": "https://www.theguardian.com/world/rss"
-}
-
-MAX_POSTS_PER_RUN = 5
-SENT_TITLES_FILE = "sent_titles.json"
-
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+SOURCES = [
+    {"name": "NYT", "url": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"},
+    {"name": "BBC", "url": "http://feeds.bbci.co.uk/news/rss.xml"},
+    {"name": "CNN", "url": "http://rss.cnn.com/rss/edition.rss"}
+]
+
+SENT_TITLES_FILE = "sent_titles.json"
+POST_LIMIT = 5
+
 def load_sent_titles():
-    if not os.path.exists(SENT_TITLES_FILE):
-        return []
-    with open(SENT_TITLES_FILE, "r") as file:
-        data = json.load(file)
-        return data.get("titles", [])
+    if os.path.exists(SENT_TITLES_FILE):
+        with open(SENT_TITLES_FILE, "r") as f:
+            return json.load(f)
+    return {}
 
 def save_sent_titles(titles):
-    with open(SENT_TITLES_FILE, "w") as file:
-        json.dump({"titles": titles}, file)
+    with open(SENT_TITLES_FILE, "w") as f:
+        json.dump(titles, f)
 
-def is_recent(entry):
-    if hasattr(entry, "published_parsed"):
-        published = datetime(*entry.published_parsed[:6])
-        return datetime.utcnow() - published <= timedelta(days=1)
-    return True
+async def summarize_article(title, description, source):
+    prompt = (
+        f"Summarize the news article from {source} with the title: '{title}'.\n\n"
+        f"Description: {description}\n\n"
+        "Keep the summary journalistic, neutral in tone, and concise — around 10 sentences max. "
+        "Target it for an American audience. Do not include the original title. Do not add hashtags."
+    )
 
-async def summarize_text(text):
     response = await openai.ChatCompletion.acreate(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "You are a professional journalist writing for an American audience. Write a clear, concise news summary of the article below in 6–10 sentences."},
-            {"role": "user", "content": text}
-        ]
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": prompt}]
     )
     return response.choices[0].message.content.strip()
 
-async def generate_image(prompt):
-    try:
-        response = await openai.Image.acreate(
-            prompt=prompt,
-            n=1,
-            size="1024x1024"
-        )
-        return response['data'][0]['url']
-    except Exception as e:
-        print("Image generation failed:", e)
-        return None
-
-async def fetch_and_send_news():
+async def send_news():
     sent_titles = load_sent_titles()
-    new_titles = []
-    feed_entries_by_source = {}
+    new_titles = {}
 
-    # Сбор свежих новостей
-    for source, url in RSS_FEEDS.items():
-        feed = feedparser.parse(url)
-        fresh_entries = [entry for entry in feed.entries if is_recent(entry)]
-        feed_entries_by_source[source] = fresh_entries
+    feeds = {s["name"]: feedparser.parse(s["url"]).entries for s in SOURCES}
+    grouped = list(zip(*(feeds[src["name"]] for src in SOURCES)))
 
-    # Публикация новостей поочередно
-    for i in range(MAX_POSTS_PER_RUN):
-        for source in RSS_FEEDS:
-            entries = feed_entries_by_source.get(source, [])
-            if i >= len(entries):
+    posts_sent = 0
+    for group in grouped:
+        for i, article in enumerate(group):
+            source = SOURCES[i]["name"]
+            title = article.title
+            description = article.get("description", "")
+            published = article.get("published_parsed")
+            image_url = article.get("media_content", [{}])[0].get("url")
+
+            if not title or not published:
                 continue
 
-            entry = entries[i]
-            if entry.title in sent_titles:
+            pub_date = datetime(*published[:6])
+            if pub_date < datetime.utcnow() - timedelta(days=1):
                 continue
 
-            summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
-            full_text = f"{entry.title}\n\n{summary}"
+            new_titles.setdefault(source, [])
 
-            try:
-                embedding_response = await openai.Embedding.acreate(
-                    model="text-embedding-ada-002",
-                    input=entry.title
-                )
-                new_embedding = embedding_response['data'][0]['embedding']
-            except Exception as e:
-                print("Embedding error:", e)
+            embedding = get_embedding(title)
+            if is_duplicate(embedding, sent_titles.get(source, [])):
                 continue
 
-            if is_duplicate(new_embedding):
-                continue
+            summary = await summarize_article(title, description, source)
+            content = f"<b>{source}</b>\n\n{summary}\n\nPublished: {pub_date.strftime('%Y-%m-%d %H:%M UTC')}"
+            photo_url = image_url if image_url else generate_image(summary)
 
-            summarized = await summarize_text(full_text)
-            image_url = await generate_image(entry.title)
+            await bot.send_photo(chat_id=CHANNEL_ID, photo=photo_url, caption=content)
+            new_titles[source].append(embedding)
+            posts_sent += 1
 
-            message = f"<b>{entry.title}</b>\n\n{summarized}\n\n<i>{source}</i>\n#News #AI"
+            if posts_sent >= POST_LIMIT:
+                save_sent_titles(new_titles)
+                return
 
-            try:
-                if image_url:
-                    photo = types.FSInputFile.from_url(image_url)
-                    await bot.send_photo(chat_id=CHANNEL_ID, photo=photo, caption=message)
-                else:
-                    await bot.send_message(chat_id=CHANNEL_ID, text=message)
-            except Exception as e:
-                print("Sending error:", e)
-
-            new_titles.append(entry.title)
-            save_embedding(entry.title, new_embedding)
-
-    save_sent_titles(sent_titles + new_titles)
+    save_sent_titles(new_titles)
 
 async def main():
-    while True:
-        try:
-            await fetch_and_send_news()
-        except Exception as e:
-            print("Fetch error:", e)
-        await asyncio.sleep(300)  # каждые 5 минут
+    await send_news()
 
 if __name__ == "__main__":
     asyncio.run(main())
