@@ -53,8 +53,7 @@ def count_tokens(text):
 
 async def summarize(title, content, source):
     prompt = (
-        f"Summarize the news article from {source} with the title:
-"
+        f"Summarize the news article from {source} with the title:"
         f""{title}"
 
 "
