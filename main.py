@@ -77,11 +77,12 @@ async def post_to_channel(article):
         return
     save_embedding(title, embedding)
 
+    image_url = None
     try:
         image_prompt = f"News: {title}"
-        image_url = generate_image(image_prompt)
-        if isinstance(image_url, dict):
-            image_url = image_url.get("url")
+        image_data = generate_image(image_prompt)
+        if isinstance(image_data, dict) and "data" in image_data and isinstance(image_data["data"], list):
+            image_url = image_data["data"][0]["url"]
     except Exception as e:
         logging.error(f"Error generating image: {e}")
         image_url = None
