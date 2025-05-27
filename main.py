@@ -66,8 +66,8 @@ async def summarize_article(title, content, source):
         return None
 
 async def post_to_channel(article):
-    title = article["title"]
-    summary = await summarize_article(title, article.get("summary", ""), article["source"])
+    title = article.get("title", "Untitled")
+    summary = await summarize_article(title, article.get("summary", ""), article.get("source", "Unknown Source"))
     if not summary:
         return
 
@@ -81,7 +81,6 @@ async def post_to_channel(article):
     try:
         image_prompt = f"Photorealistic image for a news headline: {title}. Context: {summary[:150]}"
         image_data = generate_image(image_prompt)
-
         if isinstance(image_data, dict):
             data_list = image_data.get("data")
             if isinstance(data_list, list) and len(data_list) > 0:
@@ -91,16 +90,28 @@ async def post_to_channel(article):
         image_url = None
 
     # Формат поста
-    date_str = article["published"].strftime('%Y-%m-%d %H:%M UTC')
-    message = f"<b>{title}</b>\n\n{summary}\n\n<i>{article['source']} | {date_str}</i>\n#News #AI"
+    try:
+        date_str = article.get("published", datetime.utcnow()).strftime('%Y-%m-%d %H:%M UTC')
+    except Exception as e:
+        logging.warning(f"Error formatting date: {e}")
+        date_str = "Unknown time"
+
+    try:
+        message = (
+            f"<b>{str(title)}</b>\n\n"
+            f"{str(summary)}\n\n"
+            f"<i>{str(article.get('source', ''))} | {str(date_str)}</i>\n#News #AI"
+        )
+    except Exception as e:
+        logging.error(f"Error building message: {e}")
+        return
 
     # Отправка в Telegram
     try:
         if isinstance(image_url, str) and image_url.startswith("http"):
-            # Telegram limit for photo caption is 1024 characters
             await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=message[:1024])
         else:
-            await bot.send_message(chat_id=CHANNEL_ID, text=message)
+            await bot.send_message(chat_id=CHANNEL_ID, text=message[:4096])
     except Exception as e:
         logging.error(f"Error posting to Telegram: {str(e)}")
 
