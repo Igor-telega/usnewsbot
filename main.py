@@ -106,14 +106,14 @@ async def post_to_channel(article):
         logging.error(f"Error building message: {e}")
         return
 
-    # Отправка в Telegram
+    # Финальная защита от ошибок Telegram
     try:
         if isinstance(image_url, str) and image_url.startswith("http"):
             await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=message[:1024])
         else:
             await bot.send_message(chat_id=CHANNEL_ID, text=message[:4096])
     except Exception as e:
-        logging.error(f"Error posting to Telegram: {str(e)}")
+        logging.error(f"Final posting error: {str(e)}")
 
 async def main():
     sent_titles = load_sent_titles()
