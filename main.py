@@ -82,12 +82,10 @@ async def post_to_channel(article):
         image_prompt = f"Photorealistic image for a news headline: {title}. Context: {summary[:150]}"
         image_data = generate_image(image_prompt)
 
-        # Явная проверка структуры image_data
         if isinstance(image_data, dict):
             data_list = image_data.get("data")
             if isinstance(data_list, list) and len(data_list) > 0:
                 image_url = data_list[0].get("url")
-
     except Exception as e:
         logging.error(f"Error generating image: {e}")
         image_url = None
@@ -99,11 +97,12 @@ async def post_to_channel(article):
     # Отправка в Telegram
     try:
         if isinstance(image_url, str) and image_url.startswith("http"):
-            await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=message)
+            # Telegram limit for photo caption is 1024 characters
+            await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=message[:1024])
         else:
             await bot.send_message(chat_id=CHANNEL_ID, text=message)
     except Exception as e:
-        logging.error(f"Error posting to Telegram: {e}")
+        logging.error(f"Error posting to Telegram: {str(e)}")
 
 async def main():
     sent_titles = load_sent_titles()
