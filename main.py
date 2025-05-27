@@ -81,8 +81,8 @@ async def post_to_channel(article):
     try:
         image_prompt = f"News: {title}"
         image_data = generate_image(image_prompt)
-        if isinstance(image_data, dict) and "data" in image_data and isinstance(image_data["data"], list):
-            image_url = image_data["data"][0]["url"]
+        if isinstance(image_data, dict) and "data" in image_data:
+            image_url = image_data["data"][0].get("url")
     except Exception as e:
         logging.error(f"Error generating image: {e}")
         image_url = None
@@ -140,7 +140,7 @@ async def main():
             await asyncio.sleep(5)
 
     save_sent_titles(sent_titles)
+    await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
-
