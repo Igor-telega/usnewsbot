@@ -1,10 +1,9 @@
-import asyncio
 import os
-import random
+import asyncio
 import json
 from datetime import datetime, timedelta
 
-import requests
+import aiohttp
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
@@ -16,106 +15,117 @@ from image_gen import generate_image
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai = OpenAI(api_key=OPENAI_API_KEY)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-NEWS_LIMIT = 5
-DAYS_LIMIT = 1
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-sent_titles_path = "sent_titles.json"
-if os.path.exists(sent_titles_path):
-    with open(sent_titles_path, "r") as f:
-        sent_titles = json.load(f)
-else:
-    sent_titles = []
+RSS_FEEDS = {
+    "NYT": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+    "BBC": "http://feeds.bbci.co.uk/news/rss.xml",
+    "CNN": "http://rss.cnn.com/rss/edition.rss"
+}
 
-def fetch_feeds():
-    feeds = {
-        "NYT": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
-        "CNN": "http://rss.cnn.com/rss/cnn_topstories.rss",
-        "BBC": "http://feeds.bbci.co.uk/news/rss.xml",
-    }
-    now = datetime.utcnow()
-    articles_by_source = {key: [] for key in feeds}
+def parse_feed(url):
+    return parse(url).entries
+
+def extract_articles(feeds):
+    articles_by_source = {}
+    yesterday = datetime.utcnow() - timedelta(days=1)
+
     for source, url in feeds.items():
-        feed = parse(url)
-        for entry in feed.entries:
-            published = entry.get("published_parsed") or entry.get("updated_parsed")
-            if not published:
+        entries = parse_feed(url)
+        filtered = []
+        for entry in entries:
+            try:
+                published = datetime(*entry.published_parsed[:6])
+            except Exception:
                 continue
-            published_dt = datetime(*published[:6])
-            if (now - published_dt) <= timedelta(days=DAYS_LIMIT):
-                articles_by_source[source].append({
-                    "title": entry.title,
-                    "summary": entry.summary,
-                    "link": entry.link,
-                    "published": published_dt.strftime("%a, %d %b %Y %H:%M:%S GMT"),
-                    "source": source
-                })
+            if published < yesterday:
+                continue
+            filtered.append({
+                "source": source,
+                "title": entry.title,
+                "link": entry.link,
+                "published": published.strftime("%a, %d %b %Y %H:%M:%S GMT"),
+                "summary": entry.summary
+            })
+        articles_by_source[source] = filtered
     return articles_by_source
 
-async def generate_caption(article):
-    prompt = (
-        f"Write a professional 10-sentence summary of this news article for an American audience. "
-        f"Keep it neutral and journalistic.
-
-Title: {article['title']}
-
-Summary: {article['summary']}"
-    )
-    response = openai.chat.completions.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content.strip()
-
-async def send_news():
-    articles_by_source = fetch_feeds()
-    max_articles = max(len(lst) for lst in articles_by_source.values())
-    selected_articles = []
-
-    for i in range(max_articles):
-        for source in articles_by_source:
+def interleave_articles(articles_by_source, max_count=5):
+    all_sources = list(articles_by_source.keys())
+    interleaved = []
+    for i in range(max_count):
+        for source in all_sources:
             if i < len(articles_by_source[source]):
-                selected_articles.append(articles_by_source[source][i])
-            if len(selected_articles) >= NEWS_LIMIT:
-                break
-        if len(selected_articles) >= NEWS_LIMIT:
-            break
+                interleaved.append(articles_by_source[source][i])
+    return interleaved[:max_count]
 
-    for article in selected_articles:
-        if article["title"] in sent_titles:
-            continue
-        embedding = get_embedding(article["title"])
-        if is_duplicate(embedding, [get_embedding(t) for t in sent_titles]):
-            continue
+async def summarize_article(title, summary):
+    prompt = (
+        f"Title: {title}\n"
+        f"Summary: {summary}\n\n"
+        "Write a short, journalistic news post of about 10 sentences for a Telegram channel. "
+        "Keep it neutral and journalistic. Don't use HTML formatting or emojis. "
+        "Do not include links. End with hashtags based on the topic."
+    )
 
-        caption = await generate_caption(article)
-        tags = " ".join(f"#{word.strip('.').capitalize()}" for word in article["title"].split() if word.istitle() and len(word) > 3)
-        full_caption = f"<b>{article['title']}</b>
+    completion = client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You are a news editor writing for an American audience."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7
+    )
 
-{caption}
+    return completion.choices[0].message.content.strip()
 
-"                        f"<b>Source:</b> {article['source']}
-"                        f"<b>Published:</b> {article['published']}
+async def send_article(article, sent_titles):
+    embedding = get_embedding(article["title"])
+    if is_duplicate(embedding, sent_titles):
+        return
+    summary = await summarize_article(article["title"], article["summary"])
+    image_url = await generate_image(article["title"])
 
-{tags}"
+    text = (
+        f"<b>{article['title']}</b>\n\n"
+        f"{summary}\n\n"
+        f"<i>Source:</i> {article['source']}\n"
+        f"<i>Published:</i> {article['published']}"
+    )
 
-        image = generate_image(article["title"])
-        await bot.send_photo(chat_id=int(CHANNEL_ID), photo=image, caption=full_caption, parse_mode=ParseMode.HTML)
-
-        sent_titles.append(article["title"])
+    try:
+        await bot.send_photo(
+            chat_id=CHANNEL_ID,
+            photo=image_url,
+            caption=text,
+            parse_mode=ParseMode.HTML
+        )
         save_embedding(article["title"], embedding)
-
-        with open(sent_titles_path, "w") as f:
-            json.dump(sent_titles, f)
+        await asyncio.sleep(5)
+    except Exception as e:
+        print(f"Failed to send article: {e}")
 
 async def main():
-    await send_news()
+    try:
+        with open("sent_titles.json", "r") as f:
+            sent_titles = json.load(f)
+    except FileNotFoundError:
+        sent_titles = []
+
+    articles_by_source = extract_articles(RSS_FEEDS)
+    articles = interleave_articles(articles_by_source)
+
+    for article in articles:
+        await send_article(article, sent_titles)
+
+    with open("sent_titles.json", "w") as f:
+        json.dump(sent_titles, f)
 
 if __name__ == "__main__":
     asyncio.run(main())
