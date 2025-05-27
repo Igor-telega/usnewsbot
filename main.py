@@ -1,131 +1,112 @@
 import os
-import asyncio
 import json
+import asyncio
+import logging
 from datetime import datetime, timedelta
 
-import aiohttp
-from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, types
-from aiogram.enums import ParseMode
-from feedparser import parse
+import feedparser
 from openai import OpenAI
-from embeddings import get_embedding, is_duplicate, save_embedding
+from aiogram import Bot, Dispatcher, types
+from aiogram.enums.parse_mode import ParseMode
+from dotenv import load_dotenv
+
 from image_gen import generate_image
+from embeddings import get_embedding, is_duplicate, save_embedding
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # строка, не int
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai = OpenAI(api_key=OPENAI_API_KEY)
 
-RSS_FEEDS = {
+news_feeds = {
     "NYT": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
-    "BBC": "http://feeds.bbci.co.uk/news/rss.xml",
-    "CNN": "http://rss.cnn.com/rss/edition.rss"
+    "CNN": "http://rss.cnn.com/rss/edition.rss",
+    "BBC": "http://feeds.bbci.co.uk/news/rss.xml"
 }
 
-def parse_feed(url):
-    return parse(url).entries
+sent_titles_file = "sent_titles.json"
+try:
+    with open(sent_titles_file, "r") as f:
+        sent_titles = json.load(f)
+except FileNotFoundError:
+    sent_titles = []
 
-def extract_articles(feeds):
-    articles_by_source = {}
-    yesterday = datetime.utcnow() - timedelta(days=1)
+def fetch_feed(url):
+    return feedparser.parse(url)
 
-    for source, url in feeds.items():
-        entries = parse_feed(url)
-        filtered = []
-        for entry in entries:
-            try:
-                published = datetime(*entry.published_parsed[:6])
-            except Exception:
-                continue
-            if published < yesterday:
-                continue
-            filtered.append({
-                "source": source,
-                "title": entry.title,
-                "link": entry.link,
-                "published": published.strftime("%a, %d %b %Y %H:%M:%S GMT"),
-                "summary": entry.summary
-            })
-        articles_by_source[source] = filtered
-    return articles_by_source
+def is_recent(entry, days=1):
+    published = entry.get("published_parsed")
+    if not published:
+        return False
+    pub_date = datetime(*published[:6])
+    return datetime.utcnow() - pub_date < timedelta(days=days)
 
-def interleave_articles(articles_by_source, max_count=5):
-    all_sources = list(articles_by_source.keys())
-    interleaved = []
-    for i in range(max_count):
-        for source in all_sources:
-            if i < len(articles_by_source[source]):
-                interleaved.append(articles_by_source[source][i])
-    return interleaved[:max_count]
-
-async def summarize_article(title, summary):
+async def summarize(title, description, source):
     prompt = (
+        f"Summarize the following news article from {source} in up to 10 short journalistic sentences. "
+        f"Do not repeat the title. Keep it neutral and informative. "
         f"Title: {title}\n"
-        f"Summary: {summary}\n\n"
-        "Write a short, journalistic news post of about 10 sentences for a Telegram channel. "
-        "Keep it neutral and journalistic. Don't use HTML formatting or emojis. "
-        "Do not include links. End with hashtags based on the topic."
+        f"Description: {description}"
     )
-
-    completion = client.chat.completions.create(
+    response = await openai.chat.completions.create(
         model="gpt-4",
         messages=[
-            {"role": "system", "content": "You are a news editor writing for an American audience."},
+            {"role": "system", "content": "You are a news editor."},
             {"role": "user", "content": prompt}
-        ],
-        temperature=0.7
+        ]
     )
+    return response.choices[0].message.content.strip()
 
-    return completion.choices[0].message.content.strip()
+def extract_tags(text, limit=5):
+    words = text.split()
+    tags = [f"#{word.strip('.').capitalize()}" for word in words if word.istitle()]
+    return tags[:limit]
 
-async def send_article(article, sent_titles):
-    embedding = get_embedding(article["title"])
-    if is_duplicate(embedding, sent_titles):
-        return
-    summary = await summarize_article(article["title"], article["summary"])
-    image_url = await generate_image(article["title"])
+async def post_to_telegram(text, image_url=None):
+    if image_url:
+        await bot.send_photo(CHANNEL_ID, photo=image_url, caption=text)
+    else:
+        await bot.send_message(CHANNEL_ID, text)
 
-    text = (
-        f"<b>{article['title']}</b>\n\n"
-        f"{summary}\n\n"
-        f"<i>Source:</i> {article['source']}\n"
-        f"<i>Published:</i> {article['published']}"
-    )
+async def process_news():
+    collected = []
+    max_news = 5
+    recent_news = {source: [entry for entry in fetch_feed(url).entries if is_recent(entry)] for source, url in news_feeds.items()}
+    for i in range(max_news):
+        for source, entries in recent_news.items():
+            if i < len(entries):
+                entry = entries[i]
+                if entry.title in sent_titles:
+                    continue
+                summary = await summarize(entry.title, entry.get("summary", ""), source)
+                tags = extract_tags(entry.title + " " + summary)
+                published_time = datetime(*entry.published_parsed[:6]).strftime("%a, %d %b %Y %H:%M:%S %Z")
+                source_line = f"\n\nSource: {source}\nPublished: {published_time}"
+                tag_line = "\n" + " ".join(tags) if tags else ""
+                full_post = summary + source_line + tag_line
 
-    try:
-        await bot.send_photo(
-            chat_id=CHANNEL_ID,
-            photo=image_url,
-            caption=text,
-            parse_mode=ParseMode.HTML
-        )
-        save_embedding(article["title"], embedding)
-        await asyncio.sleep(5)
-    except Exception as e:
-        print(f"Failed to send article: {e}")
+                embedding = get_embedding(entry.title)
+                if not is_duplicate(embedding, [get_embedding(title) for title in sent_titles]):
+                    image_url = entry.get("media_content", [{}])[0].get("url") if "media_content" in entry else None
+                    if not image_url:
+                        image_url = generate_image(entry.title)
+                    await post_to_telegram(full_post, image_url)
+                    sent_titles.append(entry.title)
+                    save_embedding(entry.title, embedding)
+                    with open(sent_titles_file, "w") as f:
+                        json.dump(sent_titles, f)
+                if len(collected) >= max_news:
+                    return
 
 async def main():
-    try:
-        with open("sent_titles.json", "r") as f:
-            sent_titles = json.load(f)
-    except FileNotFoundError:
-        sent_titles = []
-
-    articles_by_source = extract_articles(RSS_FEEDS)
-    articles = interleave_articles(articles_by_source)
-
-    for article in articles:
-        await send_article(article, sent_titles)
-
-    with open("sent_titles.json", "w") as f:
-        json.dump(sent_titles, f)
+    await process_news()
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
