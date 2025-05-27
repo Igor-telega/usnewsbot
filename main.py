@@ -3,15 +3,15 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
-import openai
 import requests
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.types import InputFile
-from dotenv import load_dotenv
 from feedparser import parse
 from embeddings import get_embedding, is_duplicate, save_embedding
 from image_gen import generate_image
+from openai import OpenAI
 
 load_dotenv()
 
@@ -19,13 +19,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-openai.api_key = OPENAI_API_KEY
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN, default=ParseMode.HTML)
 dp = Dispatcher()
 
-# Источники
 rss_feeds = {
     "NY Times": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
     "Reuters": "http://feeds.reuters.com/reuters/topNews",
@@ -56,8 +55,7 @@ async def summarize_article(title, content, source):
             {"role": "system", "content": "You are a professional news editor writing for an American audience. Write a concise, neutral, journalistic summary of the article in 6-10 sentences."},
             {"role": "user", "content": f"Title: {title}\nSource: {source}\nContent:\n{content}"}
         ]
-
-        response = await openai.ChatCompletion.acreate(
+        response = openai_client.chat.completions.create(
             model="gpt-4",
             messages=messages,
             temperature=0.7
@@ -82,6 +80,8 @@ async def post_to_channel(article):
     try:
         image_prompt = f"News: {title}"
         image_url = generate_image(image_prompt)
+        if isinstance(image_url, dict):
+            image_url = image_url.get("url")
     except Exception as e:
         logging.error(f"Error generating image: {e}")
         image_url = None
@@ -122,7 +122,6 @@ async def main():
             }
             articles_by_source[source].append(article)
 
-    # Публикация по очереди из разных источников
     all_articles = []
     max_len = max(len(arts) for arts in articles_by_source.values())
     for i in range(max_len):
@@ -143,3 +142,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
