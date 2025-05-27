@@ -81,8 +81,10 @@ async def post_to_channel(article):
     try:
         image_prompt = f"News: {title}"
         image_data = generate_image(image_prompt)
-        if isinstance(image_data, dict) and "data" in image_data:
+        if isinstance(image_data, dict) and "data" in image_data and isinstance(image_data["data"], list):
             image_url = image_data["data"][0].get("url")
+        else:
+            image_url = None
     except Exception as e:
         logging.error(f"Error generating image: {e}")
         image_url = None
@@ -91,7 +93,7 @@ async def post_to_channel(article):
     message = f"<b>{title}</b>\n\n{summary}\n\n<i>{article['source']} | {date_str}</i>\n#News #AI"
 
     try:
-        if image_url:
+        if image_url and isinstance(image_url, str):
             await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=message)
         else:
             await bot.send_message(chat_id=CHANNEL_ID, text=message)
