@@ -50,11 +50,17 @@ def save_sent_titles(titles):
 async def summarize_article(title, content, source):
     try:
         messages = [
-            {"role": "system", "content": "You are a professional news editor writing for an American audience. Write a concise, neutral, journalistic summary of the article in 6-10 sentences."},
-            {"role": "user", "content": f"Title: {title}\nSource: {source}\nContent:\n{content}"}
+            {
+                "role": "system",
+                "content": "You are a professional news editor writing for an American audience. Write a concise, neutral, journalistic summary of the article in 6-10 sentences."
+            },
+            {
+                "role": "user",
+                "content": f"Title: {title}\nSource: {source}\nContent:\n{content}"
+            }
         ]
         response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-3.5-turbo",  # <-- экономим
             messages=messages,
             temperature=0.7
         )
@@ -86,11 +92,6 @@ async def post_to_channel(article):
             f"{str(summary)}\n\n"
             f"<i>{str(article.get('source', ''))} | {str(date_str)}</i>\n#News #AI"
         )
-    except Exception as e:
-        logging.error(f"Error building message: {e}")
-        return
-
-    try:
         await bot.send_message(chat_id=CHANNEL_ID, text=message[:4096])
     except Exception as e:
         logging.error(f"Final posting error: {str(e)}")
