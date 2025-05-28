@@ -7,7 +7,6 @@ import requests
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
-from aiogram.types import InputFile
 from feedparser import parse
 from embeddings import get_embedding, is_duplicate, save_embedding
 from openai import OpenAI
@@ -75,11 +74,6 @@ async def post_to_channel(article):
         return
     save_embedding(title, embedding)
 
-    # Используем image из источника, если есть
-    image_url = article.get("image")
-    if isinstance(image_url, dict):
-        image_url = image_url.get("url")
-
     try:
         date_str = article.get("published", datetime.utcnow()).strftime('%Y-%m-%d %H:%M UTC')
     except Exception as e:
@@ -96,8 +90,20 @@ async def post_to_channel(article):
         logging.error(f"Error building message: {e}")
         return
 
+    # Используем изображение, если оно есть в RSS
+    image_url = None
+    if "media_content" in article:
+        try:
+            media = article["media_content"]
+            if isinstance(media, list) and len(media) > 0:
+                image_url = media[0].get("url")
+        except Exception as e:
+            logging.warning(f"Error extracting media content: {e}")
+
     try:
         logging.info(f"Sending message with image_url={image_url}")
+        if isinstance(image_url, dict):
+            image_url = image_url.get("url")
         if isinstance(image_url, str) and image_url.startswith("http"):
             await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=message[:1024])
         else:
@@ -126,9 +132,10 @@ async def main():
                 "link": entry.link,
                 "summary": entry.get("summary", ""),
                 "published": published_dt,
-                "source": source,
-                "image": entry.get("media_content", [{}])[0] if "media_content" in entry else None
+                "source": source
             }
+            if "media_content" in entry:
+                article["media_content"] = entry["media_content"]
             articles_by_source[source].append(article)
 
     all_articles = []
