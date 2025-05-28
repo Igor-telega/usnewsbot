@@ -3,9 +3,11 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
+import requests
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
+from aiogram.types import InputFile
 from feedparser import parse
 from embeddings import get_embedding, is_duplicate, save_embedding
 from openai import OpenAI
@@ -62,18 +64,6 @@ async def summarize_article(title, content, source):
         logging.error(f"Error with summary: {e}")
         return None
 
-def extract_image_url(entry):
-    try:
-        if "media_content" in entry and entry.media_content:
-            return entry.media_content[0].get("url")
-        if "media_thumbnail" in entry and entry.media_thumbnail:
-            return entry.media_thumbnail[0].get("url")
-        if "image" in entry:
-            return entry.image
-    except Exception as e:
-        logging.warning(f"Image extraction failed: {e}")
-    return None
-
 async def post_to_channel(article):
     title = article.get("title", "Untitled")
     summary = await summarize_article(title, article.get("summary", ""), article.get("source", "Unknown Source"))
@@ -85,7 +75,10 @@ async def post_to_channel(article):
         return
     save_embedding(title, embedding)
 
+    # Используем image из источника, если есть
     image_url = article.get("image")
+    if isinstance(image_url, dict):
+        image_url = image_url.get("url")
 
     try:
         date_str = article.get("published", datetime.utcnow()).strftime('%Y-%m-%d %H:%M UTC')
@@ -104,6 +97,7 @@ async def post_to_channel(article):
         return
 
     try:
+        logging.info(f"Sending message with image_url={image_url}")
         if isinstance(image_url, str) and image_url.startswith("http"):
             await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=message[:1024])
         else:
@@ -133,7 +127,7 @@ async def main():
                 "summary": entry.get("summary", ""),
                 "published": published_dt,
                 "source": source,
-                "image": extract_image_url(entry)
+                "image": entry.get("media_content", [{}])[0] if "media_content" in entry else None
             }
             articles_by_source[source].append(article)
 
