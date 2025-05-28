@@ -1,13 +1,10 @@
-# embeddings_storage.py
-
 import pickle
 import os
 
 STORAGE_FILE = "embeddings.pkl"
 
 def get_embedding(text):
-    # Реализация OpenAI embeddings или заглушка
-    return [0.1] * 1536  # пример: замени на реальную генерацию если нужно
+    return [0.1] * 1536  # временно фейковая заглушка
 
 def load_embeddings():
     if os.path.exists(STORAGE_FILE):
@@ -27,7 +24,7 @@ def save_embedding(title, embedding):
     except Exception as e:
         print("Error in save_embedding:", e)
 
-def is_duplicate(embedding, _):
+def is_duplicate(embedding):
     try:
         data = load_embeddings()
         for existing in data.values():
