@@ -90,24 +90,8 @@ async def post_to_channel(article):
         logging.error(f"Error building message: {e}")
         return
 
-    # Используем изображение, если оно есть в RSS
-    image_url = None
-    if "media_content" in article:
-        try:
-            media = article["media_content"]
-            if isinstance(media, list) and len(media) > 0:
-                image_url = media[0].get("url")
-        except Exception as e:
-            logging.warning(f"Error extracting media content: {e}")
-
     try:
-        logging.info(f"Sending message with image_url={image_url}")
-        if isinstance(image_url, dict):
-            image_url = image_url.get("url")
-        if isinstance(image_url, str) and image_url.startswith("http"):
-            await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=message[:1024])
-        else:
-            await bot.send_message(chat_id=CHANNEL_ID, text=message[:4096])
+        await bot.send_message(chat_id=CHANNEL_ID, text=message[:4096])
     except Exception as e:
         logging.error(f"Final posting error: {str(e)}")
 
@@ -134,8 +118,6 @@ async def main():
                 "published": published_dt,
                 "source": source
             }
-            if "media_content" in entry:
-                article["media_content"] = entry["media_content"]
             articles_by_source[source].append(article)
 
     all_articles = []
