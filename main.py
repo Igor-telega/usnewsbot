@@ -3,7 +3,6 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
-import requests
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
@@ -14,7 +13,7 @@ from openai import OpenAI
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))  # 💡 Убедись, что здесь число!
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -60,7 +59,7 @@ async def summarize_article(title, content, source):
             }
         ]
         response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",  # <-- экономим
+            model="gpt-3.5-turbo",
             messages=messages,
             temperature=0.7
         )
@@ -92,6 +91,7 @@ async def post_to_channel(article):
             f"{str(summary)}\n\n"
             f"<i>{str(article.get('source', ''))} | {str(date_str)}</i>\n#News #AI"
         )
+        logging.info(f"Sending message to {CHANNEL_ID}: {message[:80]}...")  # Добавлен лог
         await bot.send_message(chat_id=CHANNEL_ID, text=message[:4096])
     except Exception as e:
         logging.error(f"Final posting error: {str(e)}")
