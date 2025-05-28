@@ -3,14 +3,11 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
-import requests
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
-from aiogram.types import InputFile
 from feedparser import parse
 from embeddings import get_embedding, is_duplicate, save_embedding
-from image_gen import generate_image
 from openai import OpenAI
 
 load_dotenv()
@@ -56,7 +53,7 @@ async def summarize_article(title, content, source):
             {"role": "user", "content": f"Title: {title}\nSource: {source}\nContent:\n{content}"}
         ]
         response = openai_client.chat.completions.create(
-            model="gpt-4",
+            model="gpt-3.5-turbo",
             messages=messages,
             temperature=0.7
         )
@@ -64,6 +61,18 @@ async def summarize_article(title, content, source):
     except Exception as e:
         logging.error(f"Error with summary: {e}")
         return None
+
+def extract_image_url(entry):
+    try:
+        if "media_content" in entry and entry.media_content:
+            return entry.media_content[0].get("url")
+        if "media_thumbnail" in entry and entry.media_thumbnail:
+            return entry.media_thumbnail[0].get("url")
+        if "image" in entry:
+            return entry.image
+    except Exception as e:
+        logging.warning(f"Image extraction failed: {e}")
+    return None
 
 async def post_to_channel(article):
     title = article.get("title", "Untitled")
@@ -76,20 +85,8 @@ async def post_to_channel(article):
         return
     save_embedding(title, embedding)
 
-    # Генерация изображения
-    image_url = None
-    try:
-        image_prompt = f"Photorealistic image for a news headline: {title}. Context: {summary[:150]}"
-        image_data = generate_image(image_prompt)
-        if isinstance(image_data, dict):
-            data_list = image_data.get("data")
-            if isinstance(data_list, list) and len(data_list) > 0:
-                image_url = data_list[0].get("url")
-    except Exception as e:
-        logging.error(f"Error generating image: {e}")
-        image_url = None
+    image_url = article.get("image")
 
-    # Формат поста
     try:
         date_str = article.get("published", datetime.utcnow()).strftime('%Y-%m-%d %H:%M UTC')
     except Exception as e:
@@ -106,7 +103,6 @@ async def post_to_channel(article):
         logging.error(f"Error building message: {e}")
         return
 
-    # Финальная защита от ошибок Telegram
     try:
         if isinstance(image_url, str) and image_url.startswith("http"):
             await bot.send_photo(chat_id=CHANNEL_ID, photo=image_url, caption=message[:1024])
@@ -136,11 +132,11 @@ async def main():
                 "link": entry.link,
                 "summary": entry.get("summary", ""),
                 "published": published_dt,
-                "source": source
+                "source": source,
+                "image": extract_image_url(entry)
             }
             articles_by_source[source].append(article)
 
-    # Чередуем источники
     all_articles = []
     max_len = max(len(arts) for arts in articles_by_source.values())
     for i in range(max_len):
@@ -148,7 +144,6 @@ async def main():
             if i < len(articles):
                 all_articles.append(articles[i])
 
-    # Публикация
     count_by_source = {s: 0 for s in rss_feeds}
     for article in all_articles:
         source = article["source"]
