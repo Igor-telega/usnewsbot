@@ -7,3 +7,4 @@ httpx==0.24.1
 newspaper3k
 lxml[html_clean]
 beautifulsoup4
+psycopg2-binary==2.9.9
