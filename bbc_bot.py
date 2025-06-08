@@ -1,13 +1,14 @@
 import os
-import json
 import asyncio
+import aiohttp
 import requests
 from bs4 import BeautifulSoup
 from newspaper import Article
 from datetime import datetime, timezone
+from dateutil import parser as dateparser
 from aiogram import Bot
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 load_dotenv()
 
@@ -16,17 +17,9 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 BBC_URL = "https://www.bbc.com/news"
-PUBLISHED_FILE = "published_bbc.json"
-
-# Загружаем уже опубликованные статьи
-if os.path.exists(PUBLISHED_FILE):
-    with open(PUBLISHED_FILE, "r") as f:
-        published_urls = set(json.load(f))
-else:
-    published_urls = set()
 
 async def summarize_article(text):
     prompt = (
@@ -35,7 +28,7 @@ async def summarize_article(text):
         f"{text}"
     )
     try:
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
@@ -46,8 +39,19 @@ async def summarize_article(text):
         print("OpenAI error:", e)
         return None
 
+def is_recent(article):
+    try:
+        published = article.publish_date
+        if not published:
+            return False
+        now = datetime.now(timezone.utc)
+        age = (now - published).total_seconds() / 60  # в минутах
+        return age <= 60  # не старше 60 минут
+    except Exception as e:
+        print("Time check error:", e)
+        return False
+
 async def get_articles():
-    global published_urls
     response = requests.get(BBC_URL)
     soup = BeautifulSoup(response.content, "html.parser")
     links = soup.find_all("a", href=True)
@@ -61,7 +65,7 @@ async def get_articles():
             continue
 
         full_url = f"https://www.bbc.com{href}"
-        if full_url in seen or full_url in published_urls:
+        if full_url in seen:
             continue
         seen.add(full_url)
 
@@ -69,6 +73,10 @@ async def get_articles():
             article = Article(full_url)
             article.download()
             article.parse()
+
+            if not is_recent(article):
+                print(f"Пропущено (старое): {article.title}")
+                continue
 
             if len(article.text) < 300:
                 continue
@@ -84,12 +92,6 @@ async def get_articles():
             )
 
             await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
-            published_urls.add(full_url)
-
-            # Сохраняем новые ссылки
-            with open(PUBLISHED_FILE, "w") as f:
-                json.dump(list(published_urls), f)
-
             await asyncio.sleep(5)
 
             count += 1
@@ -101,10 +103,8 @@ async def get_articles():
             continue
 
 async def main():
-    try:
-        await get_articles()
-    finally:
-        await bot.session.close()
+    await get_articles()
+    await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
