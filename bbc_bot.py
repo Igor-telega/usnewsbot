@@ -1,12 +1,13 @@
 import os
 import asyncio
-import json
 import requests
 from bs4 import BeautifulSoup
 from newspaper import Article
+from datetime import datetime
 from aiogram import Bot
 from dotenv import load_dotenv
-from openai import OpenAI
+import openai
+import hashlib
 
 load_dotenv()
 
@@ -15,44 +16,57 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai.api_key = OPENAI_API_KEY
 
 BBC_URL = "https://www.bbc.com/news"
-TITLES_FILE = "bbc_sent_titles.json"
+sent_titles = set()
+sent_embeddings = []
 
-# Загрузка опубликованных заголовков
-def load_sent_titles():
-    if os.path.exists(TITLES_FILE):
-        with open(TITLES_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
+SIMILARITY_THRESHOLD = 0.90
 
-# Сохранение новых заголовков
-def save_sent_titles(titles):
-    with open(TITLES_FILE, "w") as f:
-        json.dump(list(titles), f)
+async def cosine_similarity(vec1, vec2):
+    import numpy as np
+    a = np.array(vec1)
+    b = np.array(vec2)
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+async def is_unique(text):
+    try:
+        response = openai.Embedding.create(
+            model="text-embedding-3-small",
+            input=text
+        )
+        new_embedding = response["data"][0]["embedding"]
+
+        for old_embedding in sent_embeddings:
+            similarity = await cosine_similarity(new_embedding, old_embedding)
+            if similarity > SIMILARITY_THRESHOLD:
+                return False
+
+        sent_embeddings.append(new_embedding)
+        return True
+    except Exception as e:
+        print("OpenAI Embedding error:", e)
+        return True  # на всякий случай считаем уникальной, если ошибка
 
 async def summarize_article(text):
     prompt = (
-        "Summarize the following news article in 6–10 simple, factual sentences for a US audience. "
-        "Avoid saying 'the article says'.\n\n"
+        "Summarize this BBC news article in 6–10 simple sentences for a US audience:\n\n"
         f"{text}"
     )
     try:
-        response = client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.5,
+            temperature=0.7,
             max_tokens=600
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        print("OpenAI error:", e)
+        print("OpenAI Summary error:", e)
         return None
 
 async def get_articles():
-    sent_titles = load_sent_titles()
-
     response = requests.get(BBC_URL)
     soup = BeautifulSoup(response.content, "html.parser")
     links = soup.find_all("a", href=True)
@@ -75,8 +89,12 @@ async def get_articles():
             article.download()
             article.parse()
 
-            if article.title in sent_titles:
-                print(f"Пропущено (заголовок уже был): {article.title}")
+            if not article.title or article.title in sent_titles:
+                print("Пропущено (заголовок уже был):", article.title)
+                continue
+
+            if not await is_unique(article.text):
+                print("Пропущено (похоже на уже отправленное):", article.title)
                 continue
 
             summary = await summarize_article(article.text)
@@ -84,21 +102,19 @@ async def get_articles():
                 continue
 
             message = (
-                f"<b>{article.title}</b>\n\n"
+                f"📰 <b>{article.title}</b>\n\n"
                 f"{summary}\n\n"
                 f"<i>Source: BBC</i>"
             )
 
             await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
-            print(f"✅ Отправлено: {article.title}")
             sent_titles.add(article.title)
-            save_sent_titles(sent_titles)
+            print("✅ Отправлено:", article.title)
 
+            await asyncio.sleep(5)
             count += 1
             if count >= 2:
                 break
-
-            await asyncio.sleep(5)
 
         except Exception as e:
             print("Parsing error:", e)
