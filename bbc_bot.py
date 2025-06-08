@@ -4,12 +4,13 @@ import asyncio
 import requests
 from bs4 import BeautifulSoup
 from newspaper import Article
+from datetime import datetime, timezone
 from aiogram import Bot
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Загрузка переменных
 load_dotenv()
+
 TELEGRAM_TOKEN = os.getenv("BBC_TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -18,21 +19,20 @@ bot = Bot(token=TELEGRAM_TOKEN)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 BBC_URL = "https://www.bbc.com/news"
+SEEN_TITLES_FILE = "seen_titles.json"
 
-# Файлы для хранения истории
-TITLE_STORAGE_FILE = "bbc_sent_titles.json"
-SUMMARY_STORAGE_FILE = "bbc_sent_summaries.json"
 
-def load_json(file):
-    try:
-        with open(file, "r") as f:
-            return json.load(f)
-    except Exception:
-        return []
+def load_seen_titles():
+    if os.path.exists(SEEN_TITLES_FILE):
+        with open(SEEN_TITLES_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
 
-def save_json(file, data):
-    with open(file, "w") as f:
-        json.dump(data, f)
+
+def save_seen_titles(seen_titles):
+    with open(SEEN_TITLES_FILE, "w") as f:
+        json.dump(list(seen_titles), f)
+
 
 async def summarize_article(text):
     prompt = (
@@ -52,15 +52,13 @@ async def summarize_article(text):
         print("OpenAI error:", e)
         return None
 
-async def get_articles():
-    sent_titles = load_json(TITLE_STORAGE_FILE)
-    sent_summaries = load_json(SUMMARY_STORAGE_FILE)
 
+async def get_articles():
+    seen_titles = load_seen_titles()
     response = requests.get(BBC_URL)
     soup = BeautifulSoup(response.content, "html.parser")
     links = soup.find_all("a", href=True)
 
-    seen = set()
     count = 0
 
     for link in links:
@@ -69,48 +67,40 @@ async def get_articles():
             continue
 
         full_url = f"https://www.bbc.com{href}"
-        if full_url in seen:
-            continue
-        seen.add(full_url)
 
         try:
             article = Article(full_url)
             article.download()
             article.parse()
 
-            if article.title in sent_titles:
-                print("Пропущено (заголовок уже был):", article.title)
+            title = article.title.strip()
+            if title in seen_titles:
+                print(f"Пропущено (заголовок уже был): {title}")
                 continue
 
             summary = await summarize_article(article.text)
             if not summary:
                 continue
 
-            if summary in sent_summaries:
-                print("Пропущено (summary уже был):", article.title)
-                continue
-
             message = (
-                f"📰 <b>{article.title}</b>\n\n"
+                f"📰 <b>{title}</b>\n\n"
                 f"{summary}\n\n"
                 f"<i>Source: BBC</i>"
             )
 
             await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
+            seen_titles.add(title)
+            save_seen_titles(seen_titles)
+
             await asyncio.sleep(5)
-
-            sent_titles.append(article.title)
-            sent_summaries.append(summary)
-            save_json(TITLE_STORAGE_FILE, sent_titles)
-            save_json(SUMMARY_STORAGE_FILE, sent_summaries)
-
             count += 1
             if count >= 2:
                 break
 
         except Exception as e:
-            print("Ошибка парсинга:", e)
+            print("Parsing error:", e)
             continue
+
 
 async def main():
     await get_articles()
