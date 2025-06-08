@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import requests
 from bs4 import BeautifulSoup
@@ -18,6 +19,14 @@ bot = Bot(token=TELEGRAM_TOKEN)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 BBC_URL = "https://www.bbc.com/news"
+PUBLISHED_FILE = "published_bbc.json"
+
+# Загружаем уже опубликованные статьи
+if os.path.exists(PUBLISHED_FILE):
+    with open(PUBLISHED_FILE, "r") as f:
+        published_urls = set(json.load(f))
+else:
+    published_urls = set()
 
 async def summarize_article(text):
     prompt = (
@@ -38,6 +47,7 @@ async def summarize_article(text):
         return None
 
 async def get_articles():
+    global published_urls
     response = requests.get(BBC_URL)
     soup = BeautifulSoup(response.content, "html.parser")
     links = soup.find_all("a", href=True)
@@ -45,20 +55,13 @@ async def get_articles():
     seen = set()
     count = 0
 
-    posted_urls_file = "bbc_posted_urls.txt"
-    if os.path.exists(posted_urls_file):
-        with open(posted_urls_file, "r") as f:
-            posted_urls = set(f.read().splitlines())
-    else:
-        posted_urls = set()
-
     for link in links:
         href = link['href']
         if not href.startswith("/news/"):
             continue
 
         full_url = f"https://www.bbc.com{href}"
-        if full_url in seen or full_url in posted_urls:
+        if full_url in seen or full_url in published_urls:
             continue
         seen.add(full_url)
 
@@ -81,12 +84,14 @@ async def get_articles():
             )
 
             await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
+            published_urls.add(full_url)
 
-            # Save URL to avoid future reposting
-            with open(posted_urls_file, "a") as f:
-                f.write(full_url + "\n")
+            # Сохраняем новые ссылки
+            with open(PUBLISHED_FILE, "w") as f:
+                json.dump(list(published_urls), f)
 
             await asyncio.sleep(5)
+
             count += 1
             if count >= 2:
                 break
@@ -96,7 +101,10 @@ async def get_articles():
             continue
 
 async def main():
-    await get_articles()
+    try:
+        await get_articles()
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
