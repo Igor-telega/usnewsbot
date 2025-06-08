@@ -3,11 +3,9 @@ import asyncio
 import requests
 from bs4 import BeautifulSoup
 from newspaper import Article
-from datetime import datetime, timezone
 from aiogram import Bot
 from dotenv import load_dotenv
 from openai import OpenAI
-from dateutil import parser as date_parser
 
 load_dotenv()
 
@@ -21,15 +19,19 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 BBC_URL = "https://www.bbc.com/news"
 POSTED_URLS_FILE = "bbc_posted_urls.txt"
 
-def load_posted_urls():
-    if os.path.exists(POSTED_URLS_FILE):
-        with open(POSTED_URLS_FILE, "r") as f:
-            return set(line.strip() for line in f)
-    return set()
+def is_recent(article):
+    # Пока что пропускаем все статьи. Добавим точную проверку позже.
+    return True
 
-def save_posted_url(url):
+def is_already_posted(url):
+    if not os.path.exists(POSTED_URLS_FILE):
+        return False
+    with open(POSTED_URLS_FILE, "r") as f:
+        return url.strip() in f.read()
+
+def mark_as_posted(url):
     with open(POSTED_URLS_FILE, "a") as f:
-        f.write(url + "\n")
+        f.write(url.strip() + "\n")
 
 async def summarize_article(text):
     prompt = (
@@ -49,32 +51,21 @@ async def summarize_article(text):
         print("OpenAI error:", e)
         return None
 
-def is_recent(article):
-    try:
-        if article.publish_date:
-            now = datetime.now(timezone.utc)
-            delta = now - article.publish_date
-            return delta.total_seconds() < 3600
-    except Exception:
-        return False
-    return False
-
 async def get_articles():
     response = requests.get(BBC_URL)
     soup = BeautifulSoup(response.content, "html.parser")
     links = soup.find_all("a", href=True)
 
     seen = set()
-    posted_urls = load_posted_urls()
     count = 0
 
     for link in links:
         href = link['href']
-        if not href.startswith("/news/"):
+        if not href.startswith("/news/") or href.startswith("/news/live"):
             continue
 
         full_url = f"https://www.bbc.com{href}"
-        if full_url in seen or full_url in posted_urls:
+        if full_url in seen or is_already_posted(full_url):
             continue
         seen.add(full_url)
 
@@ -83,8 +74,8 @@ async def get_articles():
             article.download()
             article.parse()
 
-            if len(article.text) < 300 or not is_recent(article):
-                print(f"Пропущено (не актуально или короткое): {article.title}")
+            if not is_recent(article):
+                print(f"Пропущено (устаревшее): {article.title}")
                 continue
 
             summary = await summarize_article(article.text)
@@ -98,7 +89,7 @@ async def get_articles():
             )
 
             await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
-            save_posted_url(full_url)
+            mark_as_posted(full_url)
             await asyncio.sleep(5)
 
             count += 1
