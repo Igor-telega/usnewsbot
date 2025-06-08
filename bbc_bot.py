@@ -7,9 +7,7 @@ from datetime import datetime, timezone
 from aiogram import Bot
 from dotenv import load_dotenv
 from openai import OpenAI
-import hashlib
 import json
-import aiohttp
 
 load_dotenv()
 
@@ -21,22 +19,17 @@ bot = Bot(token=TELEGRAM_TOKEN)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 BBC_URL = "https://www.bbc.com/news"
-HASH_FILE = "bbc_posted_hashes.txt"
-TITLE_FILE = "bbc_posted_titles.txt"
-URL_FILE = "bbc_posted_urls.txt"
+POSTED_URLS_FILE = "bbc_posted_urls.txt"
 
-def read_file(path):
-    if not os.path.exists(path):
+def read_posted_urls():
+    if not os.path.exists(POSTED_URLS_FILE):
         return set()
-    with open(path, "r", encoding="utf-8") as f:
+    with open(POSTED_URLS_FILE, "r", encoding="utf-8") as f:
         return set(line.strip() for line in f)
 
-def save_to_file(path, value):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"{value}\n")
-
-def hash_text(text):
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def save_posted_url(url):
+    with open(POSTED_URLS_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{url}\n")
 
 async def summarize_article(text):
     prompt = (
@@ -88,10 +81,7 @@ def is_recent(pub_date):
     return (now - pub_date).total_seconds() < 3600
 
 async def get_articles():
-    posted_hashes = read_file(HASH_FILE)
-    posted_titles = read_file(TITLE_FILE)
-    posted_urls = read_file(URL_FILE)
-
+    posted_urls = read_posted_urls()
     response = requests.get(BBC_URL)
     soup = BeautifulSoup(response.content, "html.parser")
     links = soup.find_all("a", href=True)
@@ -105,6 +95,7 @@ async def get_articles():
             continue
         full_url = f"https://www.bbc.com{href}"
         if full_url in seen_urls or full_url in posted_urls:
+            print(f"Пропущено (уже отправлено): {full_url}")
             continue
         seen_urls.add(full_url)
 
@@ -122,17 +113,8 @@ async def get_articles():
                 print(f"Пропущено (слишком короткое): {article.title}")
                 continue
 
-            if article.title.strip() in posted_titles:
-                print(f"Пропущено (заголовок уже был): {article.title}")
-                continue
-
             summary = await summarize_article(article.text)
             if not summary:
-                continue
-
-            summary_hash = hash_text(summary)
-            if summary_hash in posted_hashes:
-                print(f"Пропущено (аннотация уже была): {article.title}")
                 continue
 
             message = (
@@ -143,11 +125,7 @@ async def get_articles():
 
             await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
             print(f"✅ Отправлено: {article.title}")
-
-            save_to_file(HASH_FILE, summary_hash)
-            save_to_file(TITLE_FILE, article.title.strip())
-            save_to_file(URL_FILE, full_url)
-
+            save_posted_url(full_url)
             count += 1
             if count >= 2:
                 break
@@ -159,8 +137,7 @@ async def get_articles():
             continue
 
 async def main():
-    async with bot.session:
-        await get_articles()
+    await get_articles()
 
 if __name__ == "__main__":
     asyncio.run(main())
