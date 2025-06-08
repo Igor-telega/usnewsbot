@@ -3,10 +3,10 @@ import asyncio
 import requests
 from bs4 import BeautifulSoup
 from newspaper import Article
-from datetime import datetime
+from datetime import datetime, timezone
 from aiogram import Bot
 from dotenv import load_dotenv
-import openai
+from openai import OpenAI
 import hashlib
 
 load_dotenv()
@@ -16,46 +16,43 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
-openai.api_key = OPENAI_API_KEY
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 BBC_URL = "https://www.bbc.com/news"
-sent_titles = set()
-sent_embeddings = []
+EMBEDDING_FILE = "bbc_posted_urls.txt"
 
-SIMILARITY_THRESHOLD = 0.90
+def read_posted_hashes():
+    if not os.path.exists(EMBEDDING_FILE):
+        return set()
+    with open(EMBEDDING_FILE, "r", encoding="utf-8") as f:
+        return set(line.strip() for line in f)
 
-async def cosine_similarity(vec1, vec2):
-    import numpy as np
-    a = np.array(vec1)
-    b = np.array(vec2)
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+def save_posted_hash(hash_text):
+    with open(EMBEDDING_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{hash_text}\n")
 
-async def is_unique(text):
+async def get_embedding(text):
     try:
-        response = openai.Embedding.create(
+        response = client.embeddings.create(
             model="text-embedding-3-small",
-            input=text
+            input=[text]
         )
-        new_embedding = response["data"][0]["embedding"]
-
-        for old_embedding in sent_embeddings:
-            similarity = await cosine_similarity(new_embedding, old_embedding)
-            if similarity > SIMILARITY_THRESHOLD:
-                return False
-
-        sent_embeddings.append(new_embedding)
-        return True
+        return response.data[0].embedding
     except Exception as e:
         print("OpenAI Embedding error:", e)
-        return True  # на всякий случай считаем уникальной, если ошибка
+        return None
+
+def hash_text(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 async def summarize_article(text):
     prompt = (
-        "Summarize this BBC news article in 6–10 simple sentences for a US audience:\n\n"
+        "Summarize the following BBC news article in 6–10 simple, factual sentences for a US audience. "
+        "Do not say 'the article says'. Use plain news language:\n\n"
         f"{text}"
     )
     try:
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
@@ -63,42 +60,55 @@ async def summarize_article(text):
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        print("OpenAI Summary error:", e)
+        print("OpenAI summarization error:", e)
         return None
 
+def is_recent(pub_date):
+    if not pub_date:
+        return False
+    now = datetime.now(timezone.utc)
+    return (now - pub_date).total_seconds() < 3600
+
 async def get_articles():
+    posted_hashes = read_posted_hashes()
     response = requests.get(BBC_URL)
     soup = BeautifulSoup(response.content, "html.parser")
     links = soup.find_all("a", href=True)
 
-    seen = set()
+    seen_urls = set()
     count = 0
 
     for link in links:
         href = link['href']
         if not href.startswith("/news/"):
             continue
-
         full_url = f"https://www.bbc.com{href}"
-        if full_url in seen:
+        if full_url in seen_urls:
             continue
-        seen.add(full_url)
+        seen_urls.add(full_url)
 
         try:
             article = Article(full_url)
             article.download()
             article.parse()
 
-            if not article.title or article.title in sent_titles:
-                print("Пропущено (заголовок уже был):", article.title)
+            # Проверка даты
+            pub_date = article.publish_date
+            if not is_recent(pub_date):
+                print(f"Пропущено (не актуально): {article.title}")
                 continue
 
-            if not await is_unique(article.text):
-                print("Пропущено (похоже на уже отправленное):", article.title)
+            if len(article.text.strip()) < 100:
+                print(f"Пропущено (слишком короткое): {article.title}")
                 continue
 
             summary = await summarize_article(article.text)
             if not summary:
+                continue
+
+            summary_hash = hash_text(summary)
+            if summary_hash in posted_hashes:
+                print(f"Пропущено (уже отправлено): {article.title}")
                 continue
 
             message = (
@@ -108,16 +118,16 @@ async def get_articles():
             )
 
             await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
-            sent_titles.add(article.title)
-            print("✅ Отправлено:", article.title)
-
-            await asyncio.sleep(5)
+            print(f"✅ Отправлено: {article.title}")
+            save_posted_hash(summary_hash)
             count += 1
             if count >= 2:
                 break
 
+            await asyncio.sleep(5)
+
         except Exception as e:
-            print("Parsing error:", e)
+            print("Ошибка при обработке статьи:", e)
             continue
 
 async def main():
