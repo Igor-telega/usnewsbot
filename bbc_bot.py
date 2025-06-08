@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import hashlib
 import json
+import aiohttp
 
 load_dotenv()
 
@@ -20,28 +21,19 @@ bot = Bot(token=TELEGRAM_TOKEN)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 BBC_URL = "https://www.bbc.com/news"
-EMBEDDING_FILE = "bbc_posted_urls.txt"
+HASH_FILE = "bbc_posted_hashes.txt"
+TITLE_FILE = "bbc_posted_titles.txt"
+URL_FILE = "bbc_posted_urls.txt"
 
-def read_posted_hashes():
-    if not os.path.exists(EMBEDDING_FILE):
+def read_file(path):
+    if not os.path.exists(path):
         return set()
-    with open(EMBEDDING_FILE, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return set(line.strip() for line in f)
 
-def save_posted_hash(hash_text):
-    with open(EMBEDDING_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{hash_text}\n")
-
-async def get_embedding(text):
-    try:
-        response = client.embeddings.create(
-            model="text-embedding-3-small",
-            input=[text]
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        print("OpenAI Embedding error:", e)
-        return None
+def save_to_file(path, value):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{value}\n")
 
 def hash_text(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -69,17 +61,14 @@ def extract_publish_date(article_url):
         html = requests.get(article_url, timeout=10).text
         soup = BeautifulSoup(html, "html.parser")
 
-        # 1. Попытка из <meta>
         meta_time = soup.find("meta", {"property": "article:published_time"})
         if meta_time and meta_time.get("content"):
             return datetime.fromisoformat(meta_time["content"].replace("Z", "+00:00"))
 
-        # 2. Попытка из <time>
         time_tag = soup.find("time")
         if time_tag and time_tag.get("datetime"):
             return datetime.fromisoformat(time_tag["datetime"].replace("Z", "+00:00"))
 
-        # 3. Попытка из JSON-LD
         scripts = soup.find_all("script", {"type": "application/ld+json"})
         for script in scripts:
             try:
@@ -99,7 +88,10 @@ def is_recent(pub_date):
     return (now - pub_date).total_seconds() < 3600
 
 async def get_articles():
-    posted_hashes = read_posted_hashes()
+    posted_hashes = read_file(HASH_FILE)
+    posted_titles = read_file(TITLE_FILE)
+    posted_urls = read_file(URL_FILE)
+
     response = requests.get(BBC_URL)
     soup = BeautifulSoup(response.content, "html.parser")
     links = soup.find_all("a", href=True)
@@ -112,7 +104,7 @@ async def get_articles():
         if not href.startswith("/news/"):
             continue
         full_url = f"https://www.bbc.com{href}"
-        if full_url in seen_urls:
+        if full_url in seen_urls or full_url in posted_urls:
             continue
         seen_urls.add(full_url)
 
@@ -130,13 +122,17 @@ async def get_articles():
                 print(f"Пропущено (слишком короткое): {article.title}")
                 continue
 
+            if article.title.strip() in posted_titles:
+                print(f"Пропущено (заголовок уже был): {article.title}")
+                continue
+
             summary = await summarize_article(article.text)
             if not summary:
                 continue
 
             summary_hash = hash_text(summary)
             if summary_hash in posted_hashes:
-                print(f"Пропущено (уже отправлено): {article.title}")
+                print(f"Пропущено (аннотация уже была): {article.title}")
                 continue
 
             message = (
@@ -147,7 +143,11 @@ async def get_articles():
 
             await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
             print(f"✅ Отправлено: {article.title}")
-            save_posted_hash(summary_hash)
+
+            save_to_file(HASH_FILE, summary_hash)
+            save_to_file(TITLE_FILE, article.title.strip())
+            save_to_file(URL_FILE, full_url)
+
             count += 1
             if count >= 2:
                 break
@@ -159,7 +159,8 @@ async def get_articles():
             continue
 
 async def main():
-    await get_articles()
+    async with bot.session:
+        await get_articles()
 
 if __name__ == "__main__":
     asyncio.run(main())
