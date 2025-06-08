@@ -6,35 +6,34 @@ from newspaper import Article
 from datetime import datetime
 from aiogram import Bot
 from dotenv import load_dotenv
-import openai
+from openai import OpenAI
 
+# Загрузка переменных
 load_dotenv()
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-openai.api_key = OPENAI_API_KEY
 bot = Bot(token=TELEGRAM_TOKEN)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 CNN_URL = "https://edition.cnn.com/"
 
 async def summarize_article(text):
     prompt = (
         "Сделай краткое журналистское резюме этой статьи на английском языке для США "
-        "в 6–10 предложениях, без воды и без фраз вроде 'в этой статье говорится'. "
-        "Просто сухие, информативные факты на основе текста:\n\n"
+        "в 6–10 предложениях. Без фраз вроде 'в статье говорится'. Просто факты.\n\n"
         f"{text}"
     )
-    
+
     try:
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
             max_tokens=600
         )
-        return response.choices[0].message["content"].strip()
+        return response.choices[0].message.content.strip()
     except Exception as e:
         print("Ошибка OpenAI:", e)
         return None
@@ -49,7 +48,6 @@ async def get_articles():
 
     for link in links:
         href = link['href']
-
         if not href.startswith("/"):
             continue
         if not "/202" in href:
