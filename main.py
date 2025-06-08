@@ -1,96 +1,84 @@
 import os
 import asyncio
+import feedparser
 import requests
-from bs4 import BeautifulSoup
 from newspaper import Article
-from datetime import datetime
-from aiogram import Bot
-from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, types
 from openai import OpenAI
+from datetime import datetime
 
-# Загрузка переменных
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# Загрузка переменных окружения
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+RSS_URL = os.getenv("RSS_URL")
+SOURCE_NAME = os.getenv("SOURCE_NAME", "News")
 
-bot = Bot(token=TELEGRAM_TOKEN)
+# Файл для отслеживания опубликованных ссылок
+POSTED_URLS_FILE = "posted_urls.txt"
+
+# Проверка, публиковалась ли уже ссылка
+def is_already_posted(url):
+    if not os.path.exists(POSTED_URLS_FILE):
+        return False
+    with open(POSTED_URLS_FILE, 'r') as f:
+        posted = f.read().splitlines()
+    return url in posted
+
+# Сохраняем новую ссылку
+def mark_as_posted(url):
+    with open(POSTED_URLS_FILE, 'a') as f:
+        f.write(url + '\n')
+
+# Запуск бота
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-CNN_URL = "https://edition.cnn.com/"
-
-async def summarize_article(text):
-    prompt = (
-        "Сделай краткое журналистское резюме этой статьи на английском языке для США "
-        "в 6–10 предложениях. Без фраз вроде 'в статье говорится'. Просто факты.\n\n"
-        f"{text}"
-    )
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=600
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print("Ошибка OpenAI:", e)
-        return None
-
-async def get_articles():
-    response = requests.get(CNN_URL)
-    soup = BeautifulSoup(response.content, "html.parser")
-    links = soup.find_all("a", href=True)
-
-    seen = set()
-    count = 0
-
-    for link in links:
-        href = link['href']
-        if not href.startswith("/"):
+async def fetch_and_post_news():
+    feed = feedparser.parse(RSS_URL)
+    for entry in feed.entries[:5]:
+        url = entry.link
+        if is_already_posted(url):
             continue
-        if not "/202" in href:
-            continue
-
-        full_url = f"https://edition.cnn.com{href}"
-        if full_url in seen:
-            continue
-        seen.add(full_url)
 
         try:
-            article = Article(full_url)
+            article = Article(url)
             article.download()
             article.parse()
+            content = article.text
 
-            if len(article.text) < 300:
+            if not content.strip():
                 continue
 
-            summary = await summarize_article(article.text)
-            if not summary:
-                continue
-
-            date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-            message = (
-                f"📰 <b>{article.title}</b>\n\n"
-                f"{summary}\n\n"
-                f"<i>Источник: CNN</i>\n{date_str} #News #CNN"
+            # Генерация краткой версии новости с помощью OpenAI
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a professional journalist. Summarize the article into a short, engaging news post suitable for Telegram."},
+                    {"role": "user", "content": content}
+                ],
+                temperature=0.7,
+                max_tokens=500
             )
 
-            await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
-            await asyncio.sleep(5)
+            summary = response.choices[0].message.content.strip()
 
-            count += 1
-            if count >= 2:
-                break
+            # Отправка в Telegram
+            date = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+            caption = f"🗞 <b>{entry.title}</b>\n\n{summary}\n\nSource: {SOURCE_NAME}\n{date} #News #{SOURCE_NAME}"
+            await bot.send_message(CHANNEL_ID, caption, parse_mode="HTML")
+
+            mark_as_posted(url)
 
         except Exception as e:
-            print("Ошибка парсинга:", e)
+            print(f"Error: {e}")
             continue
 
 async def main():
-    await get_articles()
+    await fetch_and_post_news()
 
 if __name__ == "__main__":
     asyncio.run(main())
