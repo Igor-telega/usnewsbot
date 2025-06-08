@@ -8,13 +8,13 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from feedparser import parse
-from embeddings import get_embedding, is_duplicate, save_embedding
 from openai import OpenAI
+from embeddings import get_embedding, is_duplicate, save_embedding
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # ← исправлено: без int()
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # Используй ID (например, -1001234567890), а не @username!
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -50,17 +50,11 @@ def save_sent_titles(titles):
 async def summarize_article(title, content, source):
     try:
         messages = [
-            {
-                "role": "system",
-                "content": "You are a professional news editor writing for an American audience. Write a concise, neutral, journalistic summary of the article in 6-10 sentences."
-            },
-            {
-                "role": "user",
-                "content": f"Title: {title}\nSource: {source}\nContent:\n{content}"
-            }
+            {"role": "system", "content": "You are a professional news editor writing for an American audience. Write a concise, neutral, journalistic summary of the article in 6-10 sentences."},
+            {"role": "user", "content": f"Title: {title}\nSource: {source}\nContent:\n{content}"}
         ]
         response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",  # ← экономим
+            model="gpt-3.5-turbo",
             messages=messages,
             temperature=0.7
         )
@@ -88,9 +82,11 @@ async def post_to_channel(article):
 
     try:
         message = (
-            f"<b>{str(title)}</b>\n\n"
-            f"{str(summary)}\n\n"
-            f"<i>{str(article.get('source', ''))} | {str(date_str)}</i>\n#News #AI"
+            f"<b>{title}</b>\n\n"
+            f"{summary}\n\n"
+            f"<i>{article.get('source', '')} | {date_str}</i>\n"
+            f"<a href=\"{article.get('link', '')}\">Source</a>\n"
+            f"#News #AI"
         )
         await bot.send_message(chat_id=CHANNEL_ID, text=message[:4096])
     except Exception as e:
