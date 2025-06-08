@@ -8,6 +8,7 @@ from aiogram import Bot
 from dotenv import load_dotenv
 from openai import OpenAI
 import hashlib
+import json
 
 load_dotenv()
 
@@ -63,6 +64,34 @@ async def summarize_article(text):
         print("OpenAI summarization error:", e)
         return None
 
+def extract_publish_date(article_url):
+    try:
+        html = requests.get(article_url, timeout=10).text
+        soup = BeautifulSoup(html, "html.parser")
+
+        # 1. Попытка из <meta>
+        meta_time = soup.find("meta", {"property": "article:published_time"})
+        if meta_time and meta_time.get("content"):
+            return datetime.fromisoformat(meta_time["content"].replace("Z", "+00:00"))
+
+        # 2. Попытка из <time>
+        time_tag = soup.find("time")
+        if time_tag and time_tag.get("datetime"):
+            return datetime.fromisoformat(time_tag["datetime"].replace("Z", "+00:00"))
+
+        # 3. Попытка из JSON-LD
+        scripts = soup.find_all("script", {"type": "application/ld+json"})
+        for script in scripts:
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict) and "datePublished" in data:
+                    return datetime.fromisoformat(data["datePublished"].replace("Z", "+00:00"))
+            except:
+                continue
+    except Exception as e:
+        print("Ошибка извлечения даты:", e)
+    return None
+
 def is_recent(pub_date):
     if not pub_date:
         return False
@@ -92,8 +121,7 @@ async def get_articles():
             article.download()
             article.parse()
 
-            # Проверка даты
-            pub_date = article.publish_date
+            pub_date = extract_publish_date(full_url)
             if not is_recent(pub_date):
                 print(f"Пропущено (не актуально): {article.title}")
                 continue
