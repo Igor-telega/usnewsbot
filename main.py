@@ -6,7 +6,8 @@ import logging
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
-from aiogram.types import ParseMode
+from aiogram.enums import ParseMode
+from aiogram.types import Message
 import httpx
 
 # Загрузка переменных окружения
@@ -35,7 +36,7 @@ HOURS_LIMIT = 2
 
 # Telegram bot
 bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher(bot=bot)
+dp = Dispatcher()
 
 # Загрузка опубликованных заголовков
 if os.path.exists("sent_titles.json"):
