@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import requests
 from bs4 import BeautifulSoup
@@ -7,8 +8,8 @@ from aiogram import Bot
 from dotenv import load_dotenv
 from openai import OpenAI
 
+# Загрузка переменных
 load_dotenv()
-
 TELEGRAM_TOKEN = os.getenv("BBC_TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -17,21 +18,21 @@ bot = Bot(token=TELEGRAM_TOKEN)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 BBC_URL = "https://www.bbc.com/news"
-POSTED_URLS_FILE = "bbc_posted_urls.txt"
 
-def is_recent(article):
-    # Пока что пропускаем все статьи. Добавим точную проверку позже.
-    return True
+# Файлы для хранения истории
+TITLE_STORAGE_FILE = "bbc_sent_titles.json"
+SUMMARY_STORAGE_FILE = "bbc_sent_summaries.json"
 
-def is_already_posted(url):
-    if not os.path.exists(POSTED_URLS_FILE):
-        return False
-    with open(POSTED_URLS_FILE, "r") as f:
-        return url.strip() in f.read()
+def load_json(file):
+    try:
+        with open(file, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
 
-def mark_as_posted(url):
-    with open(POSTED_URLS_FILE, "a") as f:
-        f.write(url.strip() + "\n")
+def save_json(file, data):
+    with open(file, "w") as f:
+        json.dump(data, f)
 
 async def summarize_article(text):
     prompt = (
@@ -52,6 +53,9 @@ async def summarize_article(text):
         return None
 
 async def get_articles():
+    sent_titles = load_json(TITLE_STORAGE_FILE)
+    sent_summaries = load_json(SUMMARY_STORAGE_FILE)
+
     response = requests.get(BBC_URL)
     soup = BeautifulSoup(response.content, "html.parser")
     links = soup.find_all("a", href=True)
@@ -61,11 +65,11 @@ async def get_articles():
 
     for link in links:
         href = link['href']
-        if not href.startswith("/news/") or href.startswith("/news/live"):
+        if not href.startswith("/news/"):
             continue
 
         full_url = f"https://www.bbc.com{href}"
-        if full_url in seen or is_already_posted(full_url):
+        if full_url in seen:
             continue
         seen.add(full_url)
 
@@ -74,12 +78,16 @@ async def get_articles():
             article.download()
             article.parse()
 
-            if not is_recent(article):
-                print(f"Пропущено (устаревшее): {article.title}")
+            if article.title in sent_titles:
+                print("Пропущено (заголовок уже был):", article.title)
                 continue
 
             summary = await summarize_article(article.text)
             if not summary:
+                continue
+
+            if summary in sent_summaries:
+                print("Пропущено (summary уже был):", article.title)
                 continue
 
             message = (
@@ -89,15 +97,19 @@ async def get_articles():
             )
 
             await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
-            mark_as_posted(full_url)
             await asyncio.sleep(5)
+
+            sent_titles.append(article.title)
+            sent_summaries.append(summary)
+            save_json(TITLE_STORAGE_FILE, sent_titles)
+            save_json(SUMMARY_STORAGE_FILE, sent_summaries)
 
             count += 1
             if count >= 2:
                 break
 
         except Exception as e:
-            print("Parsing error:", e)
+            print("Ошибка парсинга:", e)
             continue
 
 async def main():
