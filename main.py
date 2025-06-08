@@ -142,7 +142,10 @@ async def get_articles():
 
 async def main():
     create_table()
-    await get_articles()
+    try:
+        await get_articles()
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
