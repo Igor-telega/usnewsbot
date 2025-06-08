@@ -1,14 +1,15 @@
 import feedparser
 import asyncio
-import json
 import os
-import logging
+import json
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher
+from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.types import Message
 import httpx
+import logging
+
+# === Настройки ===
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -16,111 +17,91 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Настройка логгирования
-logging.basicConfig(level=logging.INFO)
-
-# RSS-источники
-RSS_FEEDS = {
-    "NYTimes": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
-    "Reuters": "http://feeds.reuters.com/reuters/topNews",
-    "CNN": "http://rss.cnn.com/rss/edition.rss",
-    "APNews": "https://www.apnews.com/rss",
-    "The Guardian": "https://www.theguardian.com/world/rss",
-    "NPR": "https://www.npr.org/rss/rss.php?id=1001",
-}
-
-# Параметры публикации
-MAX_ARTICLES = 1
-POST_DELAY = 8  # секунд
+SOURCE_NAME = os.getenv("SOURCE_NAME", "CNN")
+RSS_URL = os.getenv("RSS_URL", "http://rss.cnn.com/rss/edition.rss")
 HOURS_LIMIT = 2
+POST_DELAY = 8
+
+# Настройка логов
+logging.basicConfig(level=logging.INFO)
 
 # Telegram bot
 bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
 
-# Загрузка опубликованных заголовков
-if os.path.exists("sent_titles.json"):
-    with open("sent_titles.json", "r") as f:
+# Загруженные заголовки
+DATA_FILE = f"sent_{SOURCE_NAME.lower()}.json"
+if os.path.exists(DATA_FILE):
+    with open(DATA_FILE, "r") as f:
         sent_titles = set(json.load(f))
 else:
     sent_titles = set()
 
-# Сохранение заголовков
-def save_sent_titles():
-    with open("sent_titles.json", "w") as f:
+def save_titles():
+    with open(DATA_FILE, "w") as f:
         json.dump(list(sent_titles), f)
 
-# Проверка, свежая ли новость
+# Проверка свежести
 def is_recent(entry):
-    published = entry.get("published_parsed")
-    if not published:
+    pub = entry.get("published_parsed")
+    if not pub:
         return False
-    pub_time = datetime(*published[:6], tzinfo=timezone.utc)
+    pub_time = datetime(*pub[:6], tzinfo=timezone.utc)
     return datetime.now(timezone.utc) - pub_time < timedelta(hours=HOURS_LIMIT)
 
-# Генерация summary через OpenAI
+# Генерация краткой сводки
 async def generate_summary(title, content):
+    prompt = (
+        f"You are a neutral news editor. Based on the following headline and content, "
+        f"write a short news summary in English, 6–10 sentences, neutral journalistic style.\n\n"
+        f"Headline: {title}\n\nContent: {content}\n\nSummary:"
+    )
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json"
     }
-    prompt = (
-        f"Ты — нейтральный новостной редактор. Составь краткую новостную сводку по следующей информации.\n\n"
-        f"Заголовок: {title}\n\n"
-        f"Содержание: {content}\n\n"
-        f"Сводка:"
-    )
-    data = {
+    payload = {
         "model": "gpt-3.5-turbo",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 350,
-        "temperature": 0.7,
+        "temperature": 0.7
     }
 
     async with httpx.AsyncClient() as client:
-        response = await client.post("https://api.openai.com/v1/chat/completions", json=data, headers=headers, timeout=30)
-        result = response.json()
-        return result["choices"][0]["message"]["content"].strip()
+        response = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
+        return response.json()["choices"][0]["message"]["content"].strip()
 
-# Публикация в Telegram
-async def post_to_telegram(title, summary, source, link):
-    hashtags = "#News #AI"
+# Публикация
+async def post_to_channel(title, summary):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    message = (
+    hashtags = "#News #AI"
+    text = (
         f"<b>{title}</b>\n\n"
         f"{summary}\n\n"
-        f"<i>{source} — {now}</i>\n"
+        f"<i>{SOURCE_NAME} — {now}</i>\n"
         f"{hashtags}"
     )
-    await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
-# Основной цикл
-async def fetch_and_post():
-    for source, url in RSS_FEEDS.items():
-        feed = feedparser.parse(url)
-        count = 0
+# Основная логика
+async def run_bot():
+    feed = feedparser.parse(RSS_URL)
 
-        for entry in feed.entries:
-            if count >= MAX_ARTICLES:
-                break
+    for entry in feed.entries[:3]:  # максимум 3 новости за запуск
+        title = entry.title.strip()
+        if title in sent_titles or not is_recent(entry):
+            continue
 
-            title = entry.title.strip()
-            link = entry.link
-            summary_text = entry.get("summary", "")[:1000]
+        content = entry.get("summary", "")[:1000]
 
-            if title in sent_titles or not is_recent(entry):
-                continue
+        try:
+            summary = await generate_summary(title, content)
+            await post_to_channel(title, summary)
+            sent_titles.add(title)
+            save_titles()
+            await asyncio.sleep(POST_DELAY)
+        except Exception as e:
+            logging.error(f"Error while processing {title}: {e}")
 
-            try:
-                summary = await generate_summary(title, summary_text)
-                await post_to_telegram(title, summary, source, link)
-                sent_titles.add(title)
-                count += 1
-                save_sent_titles()
-                await asyncio.sleep(POST_DELAY)
-            except Exception as e:
-                logging.error(f"Error processing article '{title}': {e}")
-
-# Запуск
+# Старт
 if __name__ == "__main__":
-    asyncio.run(fetch_and_post())
+    asyncio.run(run_bot())
