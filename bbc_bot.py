@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from aiogram import Bot
 from dotenv import load_dotenv
 from openai import OpenAI
+import hashlib
 import json
 
 load_dotenv()
@@ -19,16 +20,16 @@ bot = Bot(token=TELEGRAM_TOKEN)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 BBC_URL = "https://www.bbc.com/news"
-POSTED_URLS_FILE = "bbc_posted_urls.txt"
+URL_LOG_FILE = "bbc_posted_urls.txt"
 
 def read_posted_urls():
-    if not os.path.exists(POSTED_URLS_FILE):
+    if not os.path.exists(URL_LOG_FILE):
         return set()
-    with open(POSTED_URLS_FILE, "r", encoding="utf-8") as f:
+    with open(URL_LOG_FILE, "r", encoding="utf-8") as f:
         return set(line.strip() for line in f)
 
 def save_posted_url(url):
-    with open(POSTED_URLS_FILE, "a", encoding="utf-8") as f:
+    with open(URL_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"{url}\n")
 
 async def summarize_article(text):
@@ -91,8 +92,11 @@ async def get_articles():
 
     for link in links:
         href = link['href']
-        if not href.startswith("/news/"):
+
+        # ⚠️ Пропускаем всё, что не похоже на статью
+        if not (href.startswith("/news/articles/") or (href.startswith("/news/") and href[6:].split("/")[0].isdigit())):
             continue
+
         full_url = f"https://www.bbc.com{href}"
         if full_url in seen_urls or full_url in posted_urls:
             print(f"Пропущено (уже отправлено): {full_url}")
