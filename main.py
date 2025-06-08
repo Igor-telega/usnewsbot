@@ -1,107 +1,65 @@
-import feedparser
-import asyncio
 import os
-import json
-from datetime import datetime, timezone, timedelta
+import asyncio
+from aiogram import Bot, Dispatcher
+from newspaper import Article
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
 from dotenv import load_dotenv
-from aiogram import Bot
-from aiogram.enums import ParseMode
-import httpx
-import logging
 
-# === Настройки ===
-
-# Загрузка переменных окружения
 load_dotenv()
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-SOURCE_NAME = os.getenv("SOURCE_NAME", "CNN")
-RSS_URL = os.getenv("RSS_URL", "http://rss.cnn.com/rss/edition.rss")
-HOURS_LIMIT = 2
-POST_DELAY = 8
-
-# Настройка логов
-logging.basicConfig(level=logging.INFO)
-
-# Telegram bot
 bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
 
-# Загруженные заголовки
-DATA_FILE = f"sent_{SOURCE_NAME.lower()}.json"
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "r") as f:
-        sent_titles = set(json.load(f))
-else:
-    sent_titles = set()
+CNN_URL = "https://edition.cnn.com/"
 
-def save_titles():
-    with open(DATA_FILE, "w") as f:
-        json.dump(list(sent_titles), f)
+async def get_latest_articles():
+    response = requests.get(CNN_URL)
+    soup = BeautifulSoup(response.content, "html.parser")
+    links = soup.find_all("a", href=True)
 
-# Проверка свежести
-def is_recent(entry):
-    pub = entry.get("published_parsed")
-    if not pub:
-        return False
-    pub_time = datetime(*pub[:6], tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) - pub_time < timedelta(hours=HOURS_LIMIT)
-
-# Генерация краткой сводки
-async def generate_summary(title, content):
-    prompt = (
-        f"You are a neutral news editor. Based on the following headline and content, "
-        f"write a short news summary in English, 6–10 sentences, neutral journalistic style.\n\n"
-        f"Headline: {title}\n\nContent: {content}\n\nSummary:"
-    )
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "gpt-3.5-turbo",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 350,
-        "temperature": 0.7
-    }
-
-    async with httpx.AsyncClient() as client:
-        response = await client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
-        return response.json()["choices"][0]["message"]["content"].strip()
-
-# Публикация
-async def post_to_channel(title, summary):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    hashtags = "#News #AI"
-    text = (
-        f"<b>{title}</b>\n\n"
-        f"{summary}\n\n"
-        f"<i>{SOURCE_NAME} — {now}</i>\n"
-        f"{hashtags}"
-    )
-    await bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-# Основная логика
-async def run_bot():
-    feed = feedparser.parse(RSS_URL)
-
-    for entry in feed.entries[:3]:  # максимум 3 новости за запуск
-        title = entry.title.strip()
-        if title in sent_titles or not is_recent(entry):
+    sent = 0
+    for link in links:
+        href = link['href']
+        if href.startswith("/"):
+            full_url = f"https://edition.cnn.com{href}"
+        elif href.startswith("https://"):
+            full_url = href
+        else:
             continue
 
-        content = entry.get("summary", "")[:1000]
+        # Пропустим повторяющиеся/ненужные
+        if "/videos/" in full_url or "/live-news/" in full_url:
+            continue
 
         try:
-            summary = await generate_summary(title, content)
-            await post_to_channel(title, summary)
-            sent_titles.add(title)
-            save_titles()
-            await asyncio.sleep(POST_DELAY)
-        except Exception as e:
-            logging.error(f"Error while processing {title}: {e}")
+            article = Article(full_url)
+            article.download()
+            article.parse()
 
-# Старт
+            title = article.title
+            text = article.text[:1000]  # Ограничим объём
+            date = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+            message = f"📰 <b>{title}</b>\n\n{text}\n\n<a href='{full_url}'>Источник (CNN)</a>\n{date} #News #CNN"
+
+            await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML", disable_web_page_preview=False)
+            sent += 1
+            await asyncio.sleep(5)
+
+            if sent >= 2:
+                break
+
+        except Exception as e:
+            print("Ошибка:", e)
+            continue
+
+async def main():
+    await get_latest_articles()
+
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    asyncio.run(main())
