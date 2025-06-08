@@ -1,65 +1,98 @@
 import os
 import asyncio
-from aiogram import Bot, Dispatcher
-from newspaper import Article
 import requests
 from bs4 import BeautifulSoup
+from newspaper import Article
 from datetime import datetime
+from aiogram import Bot
 from dotenv import load_dotenv
+import openai
 
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+openai.api_key = OPENAI_API_KEY
 bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
 
 CNN_URL = "https://edition.cnn.com/"
 
-async def get_latest_articles():
+async def summarize_article(text):
+    prompt = (
+        "Сделай краткое журналистское резюме этой статьи на русском языке "
+        "в 6–10 предложениях, без воды и без фраз вроде 'в этой статье говорится'. "
+        "Просто сухие, информативные факты на основе текста:\n\n"
+        f"{text}"
+    )
+    
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=600
+        )
+        return response.choices[0].message["content"].strip()
+    except Exception as e:
+        print("Ошибка OpenAI:", e)
+        return None
+
+async def get_articles():
     response = requests.get(CNN_URL)
     soup = BeautifulSoup(response.content, "html.parser")
     links = soup.find_all("a", href=True)
 
-    sent = 0
+    seen = set()
+    count = 0
+
     for link in links:
         href = link['href']
-        if href.startswith("/"):
-            full_url = f"https://edition.cnn.com{href}"
-        elif href.startswith("https://"):
-            full_url = href
-        else:
+
+        if not href.startswith("/"):
+            continue
+        if not "/202" in href:
             continue
 
-        # Пропустим повторяющиеся/ненужные
-        if "/videos/" in full_url or "/live-news/" in full_url:
+        full_url = f"https://edition.cnn.com{href}"
+        if full_url in seen:
             continue
+        seen.add(full_url)
 
         try:
             article = Article(full_url)
             article.download()
             article.parse()
 
-            title = article.title
-            text = article.text[:1000]  # Ограничим объём
-            date = datetime.now().strftime("%Y-%m-%d %H:%M")
+            if len(article.text) < 300:
+                continue
 
-            message = f"📰 <b>{title}</b>\n\n{text}\n\n<a href='{full_url}'>Источник (CNN)</a>\n{date} #News #CNN"
+            summary = await summarize_article(article.text)
+            if not summary:
+                continue
 
-            await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML", disable_web_page_preview=False)
-            sent += 1
+            date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+            message = (
+                f"📰 <b>{article.title}</b>\n\n"
+                f"{summary}\n\n"
+                f"<i>Источник: CNN</i>\n{date_str} #News #CNN"
+            )
+
+            await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
             await asyncio.sleep(5)
 
-            if sent >= 2:
+            count += 1
+            if count >= 2:
                 break
 
         except Exception as e:
-            print("Ошибка:", e)
+            print("Ошибка парсинга:", e)
             continue
 
 async def main():
-    await get_latest_articles()
+    await get_articles()
 
 if __name__ == "__main__":
     asyncio.run(main())
