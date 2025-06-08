@@ -45,13 +45,20 @@ async def get_articles():
     seen = set()
     count = 0
 
+    posted_urls_file = "bbc_posted_urls.txt"
+    if os.path.exists(posted_urls_file):
+        with open(posted_urls_file, "r") as f:
+            posted_urls = set(f.read().splitlines())
+    else:
+        posted_urls = set()
+
     for link in links:
         href = link['href']
         if not href.startswith("/news/"):
             continue
 
         full_url = f"https://www.bbc.com{href}"
-        if full_url in seen:
+        if full_url in seen or full_url in posted_urls:
             continue
         seen.add(full_url)
 
@@ -74,8 +81,12 @@ async def get_articles():
             )
 
             await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
-            await asyncio.sleep(5)
 
+            # Save URL to avoid future reposting
+            with open(posted_urls_file, "a") as f:
+                f.write(full_url + "\n")
+
+            await asyncio.sleep(5)
             count += 1
             if count >= 2:
                 break
