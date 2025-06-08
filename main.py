@@ -1,84 +1,111 @@
 import os
 import asyncio
-import feedparser
 import requests
+from bs4 import BeautifulSoup
 from newspaper import Article
-from aiogram import Bot, Dispatcher, types
-from openai import OpenAI
 from datetime import datetime
+from aiogram import Bot
+from dotenv import load_dotenv
+from openai import OpenAI
 
-# Загрузка переменных окружения
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
+# Загрузка переменных
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-RSS_URL = os.getenv("RSS_URL")
-SOURCE_NAME = os.getenv("SOURCE_NAME", "News")
 
-# Файл для отслеживания опубликованных ссылок
-POSTED_URLS_FILE = "posted_urls.txt"
-
-# Проверка, публиковалась ли уже ссылка
-def is_already_posted(url):
-    if not os.path.exists(POSTED_URLS_FILE):
-        return False
-    with open(POSTED_URLS_FILE, 'r') as f:
-        posted = f.read().splitlines()
-    return url in posted
-
-# Сохраняем новую ссылку
-def mark_as_posted(url):
-    with open(POSTED_URLS_FILE, 'a') as f:
-        f.write(url + '\n')
-
-# Запуск бота
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-# OpenAI client
+bot = Bot(token=TELEGRAM_TOKEN)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-async def fetch_and_post_news():
-    feed = feedparser.parse(RSS_URL)
-    for entry in feed.entries[:5]:
-        url = entry.link
-        if is_already_posted(url):
+CNN_URL = "https://edition.cnn.com/"
+POSTED_FILE = "posted_urls.txt"
+
+# Загружаем уже опубликованные ссылки
+def load_posted_urls():
+    if not os.path.exists(POSTED_FILE):
+        return set()
+    with open(POSTED_FILE, "r") as file:
+        return set(line.strip() for line in file)
+
+# Сохраняем новую ссылку
+def save_posted_url(url):
+    with open(POSTED_FILE, "a") as file:
+        file.write(url + "\n")
+
+async def summarize_article(text):
+    prompt = (
+        "Summarize the following article in the style of a professional journalist. "
+        "Write in English for a U.S. audience in 6–10 sentences. Avoid saying 'the article says' or similar phrases. Just state the facts:\n\n"
+        f"{text}"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=600
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print("OpenAI Error:", e)
+        return None
+
+async def get_articles():
+    posted_urls = load_posted_urls()
+    response = requests.get(CNN_URL)
+    soup = BeautifulSoup(response.content, "html.parser")
+    links = soup.find_all("a", href=True)
+
+    seen = set()
+    count = 0
+
+    for link in links:
+        href = link['href']
+        if not href.startswith("/"):
+            continue
+        if not "/202" in href:
             continue
 
+        full_url = f"https://edition.cnn.com{href}"
+        if full_url in seen or full_url in posted_urls:
+            continue
+        seen.add(full_url)
+
         try:
-            article = Article(url)
+            article = Article(full_url)
             article.download()
             article.parse()
-            content = article.text
 
-            if not content.strip():
+            if len(article.text) < 300:
                 continue
 
-            # Генерация краткой версии новости с помощью OpenAI
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a professional journalist. Summarize the article into a short, engaging news post suitable for Telegram."},
-                    {"role": "user", "content": content}
-                ],
-                temperature=0.7,
-                max_tokens=500
+            summary = await summarize_article(article.text)
+            if not summary:
+                continue
+
+            date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+            message = (
+                f"📰 <b>{article.title}</b>\n\n"
+                f"{summary}\n\n"
+                f"<i>Source: CNN</i>\n{date_str} #News #CNN"
             )
 
-            summary = response.choices[0].message.content.strip()
+            await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode="HTML")
+            save_posted_url(full_url)
+            await asyncio.sleep(5)
 
-            # Отправка в Telegram
-            date = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-            caption = f"🗞 <b>{entry.title}</b>\n\n{summary}\n\nSource: {SOURCE_NAME}\n{date} #News #{SOURCE_NAME}"
-            await bot.send_message(CHANNEL_ID, caption, parse_mode="HTML")
-
-            mark_as_posted(url)
+            count += 1
+            if count >= 2:
+                break
 
         except Exception as e:
-            print(f"Error: {e}")
+            print("Parsing error:", e)
             continue
 
 async def main():
-    await fetch_and_post_news()
+    await get_articles()
 
 if __name__ == "__main__":
     asyncio.run(main())
