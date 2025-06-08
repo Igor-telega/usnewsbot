@@ -1,140 +1,125 @@
-import os
-import json
+import feedparser
 import asyncio
+import json
+import os
 import logging
-from datetime import datetime, timedelta
-import requests
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
-from aiogram.enums import ParseMode
-from feedparser import parse
-from openai import OpenAI
-from embeddings import get_embedding, is_duplicate, save_embedding
+from aiogram.types import ParseMode
+import httpx
 
+# Загрузка переменных окружения
 load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # Используй ID (например, -1001234567890), а не @username!
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+# Настройка логгирования
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(token=BOT_TOKEN, default=ParseMode.HTML)
-dp = Dispatcher()
-
-rss_feeds = {
-    "NY Times": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+# RSS-источники
+RSS_FEEDS = {
+    "NYTimes": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
     "Reuters": "http://feeds.reuters.com/reuters/topNews",
-    "CNN": "http://rss.cnn.com/rss/cnn_topstories.rss",
-    "AP News": "https://apnews.com/rss",
+    "CNN": "http://rss.cnn.com/rss/edition.rss",
+    "APNews": "https://www.apnews.com/rss",
     "The Guardian": "https://www.theguardian.com/world/rss",
-    "NPR": "https://feeds.npr.org/1001/rss.xml"
+    "NPR": "https://www.npr.org/rss/rss.php?id=1001",
 }
 
-MAX_PER_SOURCE = 1
-TIME_LIMIT_HOURS = 1
-SENT_TITLES_FILE = "sent_titles.json"
+# Параметры публикации
+MAX_ARTICLES = 1
+POST_DELAY = 8  # секунд
+HOURS_LIMIT = 2
 
-def load_sent_titles():
-    try:
-        with open(SENT_TITLES_FILE, "r") as f:
-            return json.load(f)["titles"]
-    except FileNotFoundError:
-        return []
+# Telegram bot
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher(bot=bot)
 
-def save_sent_titles(titles):
-    with open(SENT_TITLES_FILE, "w") as f:
-        json.dump({"titles": titles}, f)
+# Загрузка опубликованных заголовков
+if os.path.exists("sent_titles.json"):
+    with open("sent_titles.json", "r") as f:
+        sent_titles = set(json.load(f))
+else:
+    sent_titles = set()
 
-async def summarize_article(title, content, source):
-    try:
-        messages = [
-            {"role": "system", "content": "You are a professional news editor writing for an American audience. Write a concise, neutral, journalistic summary of the article in 6-10 sentences."},
-            {"role": "user", "content": f"Title: {title}\nSource: {source}\nContent:\n{content}"}
-        ]
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            temperature=0.7
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"Error with summary: {e}")
-        return None
+# Сохранение заголовков
+def save_sent_titles():
+    with open("sent_titles.json", "w") as f:
+        json.dump(list(sent_titles), f)
 
-async def post_to_channel(article):
-    title = article.get("title", "Untitled")
-    summary = await summarize_article(title, article.get("summary", ""), article.get("source", "Unknown Source"))
-    if not summary:
-        return
+# Проверка, свежая ли новость
+def is_recent(entry):
+    published = entry.get("published_parsed")
+    if not published:
+        return False
+    pub_time = datetime(*published[:6], tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - pub_time < timedelta(hours=HOURS_LIMIT)
 
-    embedding = get_embedding(summary)
-    if is_duplicate(embedding, "embeddings_storage.py"):
-        return
-    save_embedding(title, embedding)
+# Генерация summary через OpenAI
+async def generate_summary(title, content):
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    prompt = (
+        f"Ты — нейтральный новостной редактор. Составь краткую новостную сводку по следующей информации.\n\n"
+        f"Заголовок: {title}\n\n"
+        f"Содержание: {content}\n\n"
+        f"Сводка:"
+    )
+    data = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 350,
+        "temperature": 0.7,
+    }
 
-    try:
-        date_str = article.get("published", datetime.utcnow()).strftime('%Y-%m-%d %H:%M UTC')
-    except Exception as e:
-        logging.warning(f"Error formatting date: {e}")
-        date_str = "Unknown time"
+    async with httpx.AsyncClient() as client:
+        response = await client.post("https://api.openai.com/v1/chat/completions", json=data, headers=headers, timeout=30)
+        result = response.json()
+        return result["choices"][0]["message"]["content"].strip()
 
-    try:
-        message = (
-            f"<b>{title}</b>\n\n"
-            f"{summary}\n\n"
-            f"<i>{article.get('source', '')} | {date_str}</i>\n"
-            f"<a href=\"{article.get('link', '')}\">Source</a>\n"
-            f"#News #AI"
-        )
-        await bot.send_message(chat_id=CHANNEL_ID, text=message[:4096])
-    except Exception as e:
-        logging.error(f"Final posting error: {str(e)}")
+# Публикация в Telegram
+async def post_to_telegram(title, summary, source, link):
+    hashtags = "#News #AI"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    message = (
+        f"<b>{title}</b>\n\n"
+        f"{summary}\n\n"
+        f"<i>{source} — {now}</i>\n"
+        f"{hashtags}"
+    )
+    await bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
-async def main():
-    sent_titles = load_sent_titles()
-    articles_by_source = {source: [] for source in rss_feeds}
+# Основной цикл
+async def fetch_and_post():
+    for source, url in RSS_FEEDS.items():
+        feed = feedparser.parse(url)
+        count = 0
 
-    now = datetime.utcnow()
-    limit_time = now - timedelta(hours=TIME_LIMIT_HOURS)
-
-    for source, url in rss_feeds.items():
-        feed = parse(url)
         for entry in feed.entries:
-            published_parsed = entry.get("published_parsed")
-            if not published_parsed:
+            if count >= MAX_ARTICLES:
+                break
+
+            title = entry.title.strip()
+            link = entry.link
+            summary_text = entry.get("summary", "")[:1000]
+
+            if title in sent_titles or not is_recent(entry):
                 continue
-            published_dt = datetime(*published_parsed[:6])
-            if published_dt < limit_time:
-                continue
-            article = {
-                "title": entry.title,
-                "link": entry.link,
-                "summary": entry.get("summary", ""),
-                "published": published_dt,
-                "source": source
-            }
-            articles_by_source[source].append(article)
 
-    all_articles = []
-    max_len = max(len(arts) for arts in articles_by_source.values())
-    for i in range(max_len):
-        for source, articles in articles_by_source.items():
-            if i < len(articles):
-                all_articles.append(articles[i])
+            try:
+                summary = await generate_summary(title, summary_text)
+                await post_to_telegram(title, summary, source, link)
+                sent_titles.add(title)
+                count += 1
+                save_sent_titles()
+                await asyncio.sleep(POST_DELAY)
+            except Exception as e:
+                logging.error(f"Error processing article '{title}': {e}")
 
-    count_by_source = {s: 0 for s in rss_feeds}
-    for article in all_articles:
-        source = article["source"]
-        if article["title"] not in sent_titles and count_by_source[source] < MAX_PER_SOURCE:
-            await post_to_channel(article)
-            sent_titles.append(article["title"])
-            count_by_source[source] += 1
-            await asyncio.sleep(5)
-
-    save_sent_titles(sent_titles)
-    await bot.session.close()
-
+# Запуск
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(fetch_and_post())
